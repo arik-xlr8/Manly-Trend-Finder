@@ -14,8 +14,8 @@ from typing import Literal, Optional, List
 # ======================
 
 def fetch_ohlc_from_api(
-    symbol: str = "AVAXUSDT",
-    interval: str = "4h",
+    symbol: str = "BTCUSDT",
+    interval: str = "15m",
     limit: int = 500,
 ) -> pd.DataFrame:
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -83,30 +83,6 @@ def generate_trades(
     stop_buffer_pct: float = 0.0,  # şimdilik kullanılmıyor ama imzayı bozmayalım
     right_bars: int = 2,           # pivot onayı için kaç bar bekleniyor (find_swings ile aynı olmalı)
 ) -> List[Trade]:
-    """
-    Strateji (senin tarif ettiğin sade versiyon):
-
-    - Local Bottom (LB):
-        Son LB (sp) ve ondan önceki LB (prev_lb) var.
-        Eğer prev_lb.price < sp.price -> higher low -> yükselen trend.
-        => Long aç.
-        Long giriş: sp.index + right_bars (pivot onay mumunda).
-        Long çıkış: Sonraki LH pivotunun onaylandığı mumda.
-
-    - Local High (LH):
-        Son LH (sp) ve ondan önceki LH (prev_lh) var.
-        Eğer prev_lh.price > sp.price -> lower high -> düşen trend.
-        => Short aç.
-        Short giriş: sp.index + right_bars.
-        Short çıkış: Sonraki LB pivotunun onaylandığı mumda.
-
-    - Long kapandığında:
-        Eğer bu LH aynı zamanda prev_lh'den düşükse -> aynı mumda short açılabilir.
-
-    - Short kapandığında:
-        Eğer bu LB aynı zamanda prev_lb'den yüksekse -> aynı mumda long açılabilir.
-    """
-
     closes = df["Close"].values
     n = len(df)
 
@@ -133,11 +109,15 @@ def generate_trades(
         # ======================
         if current_trade is not None:
             if current_trade.direction == "long" and sp.kind == "LH":
-                # Long'u bu LH onay mumunda kapat
-                current_trade.exit_index = signal_idx
-                current_trade.exit_price = closes[signal_idx]
-                current_trade.exit_reason = "long_exit_LH"
-                trades.append(current_trade)
+                exit_idx = signal_idx
+
+                # Eğer gerçekten en az 1 bar açık kaldıysa trade'i kabul et
+                if exit_idx > current_trade.entry_index:
+                    current_trade.exit_index = exit_idx
+                    current_trade.exit_price = closes[exit_idx]
+                    current_trade.exit_reason = "long_exit_LH"
+                    trades.append(current_trade)
+                # Yoksa, entry == exit ise trade'i tamamen çöpe at
                 current_trade = None
 
                 # Aynı LH pivotu, önceki LH'den düşükse -> düşen trend -> aynı mumda SHORT aç
@@ -150,11 +130,13 @@ def generate_trades(
                     )
 
             elif current_trade.direction == "short" and sp.kind == "LB":
-                # Short'u bu LB onay mumunda kapat
-                current_trade.exit_index = signal_idx
-                current_trade.exit_price = closes[signal_idx]
-                current_trade.exit_reason = "short_exit_LB"
-                trades.append(current_trade)
+                exit_idx = signal_idx
+
+                if exit_idx > current_trade.entry_index:
+                    current_trade.exit_index = exit_idx
+                    current_trade.exit_price = closes[exit_idx]
+                    current_trade.exit_reason = "short_exit_LB"
+                    trades.append(current_trade)
                 current_trade = None
 
                 # Aynı LB pivotu, önceki LB'den yüksekse -> yükselen trend -> aynı mumda LONG aç
@@ -200,6 +182,13 @@ def generate_trades(
         else:  # "LH"
             last_lh = sp
 
+    # ======================
+    # 4) HÂLÂ AÇIK OLAN TRADE VARSA, EXIT'SİZ OLARAK EKLE
+    # ======================
+    if current_trade is not None:
+        # exit_index / exit_price / exit_reason = None kalacak
+        trades.append(current_trade)
+
     return trades
 
 
@@ -222,32 +211,59 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
     short_exit  = np.full(n, np.nan)
 
     for tr in trades:
-        if tr.entry_index is None or tr.exit_index is None:
+        if tr.entry_index is None:
             continue
 
         ei = tr.entry_index
-        xi = tr.exit_index
 
-        if ei < 0 or ei >= n or xi < 0 or xi >= n:
+        if ei < 0 or ei >= n:
             continue
 
-        if tr.direction == "long":
-            long_mask[ei: xi + 1] = True
+        # Çıkış var mı?
+        if tr.exit_index is None:
+            has_exit = False
+            xi = n - 1  # açık trade ise tüneli grafiğin son mumuna kadar götür
+        else:
+            has_exit = True
+            xi = tr.exit_index
+            if xi < 0 or xi >= n:
+                continue
 
-            # Long girişi: mumun biraz altına yuvarlak
-            long_entry[ei] = df["Low"].iloc[ei] * 0.995
+        # Güvenlik: exit <= entry ise tünel boyama (zaten generate_trades bunları filtreliyor ama dursun)
+        if xi <= ei:
+            # sadece entry noktası çizilsin, tünel yok
+            if tr.direction == "long":
+                long_entry[ei] = df["Low"].iloc[ei] * 0.995
+            else:
+                short_entry[ei] = df["High"].iloc[ei] * 1.005
+            continue
 
-            # Long çıkışı: mumun biraz üstüne yuvarlak
-            long_exit[xi] = df["High"].iloc[xi] * 1.005
+        # Tünel aralığı: ENTRY'den EXIT'e kadar (ikisinin de dahil)
+        start = ei
+        end = xi
 
-        else:  # short
-            short_mask[ei: xi + 1] = True
+        if start <= end:
+            if tr.direction == "long":
+                # Long trend tüneli
+                long_mask[start: end + 1] = True
 
-            # Short girişi: mumun biraz üstüne yuvarlak
-            short_entry[ei] = df["High"].iloc[ei] * 1.005
+                # Long girişi: mumun biraz altına yuvarlak (entry barında)
+                long_entry[ei] = df["Low"].iloc[ei] * 0.995
 
-            # Short çıkışı: mumun biraz altına yuvarlak
-            short_exit[xi] = df["Low"].iloc[xi] * 0.995
+                # Long çıkışı varsa: mumun biraz üstüne yuvarlak (exit barında)
+                if has_exit:
+                    long_exit[xi] = df["High"].iloc[xi] * 1.005
+
+            else:  # short
+                # Short trend tüneli
+                short_mask[start: end + 1] = True
+
+                # Short girişi: mumun biraz üstüne yuvarlak (entry barında)
+                short_entry[ei] = df["High"].iloc[ei] * 1.005
+
+                # Short çıkışı varsa: mumun biraz altına yuvarlak (exit barında)
+                if has_exit:
+                    short_exit[xi] = df["Low"].iloc[xi] * 0.995
 
     # === Trend tüneli bandları (NumPy array) ===
     lows  = df["Low"].values
@@ -361,6 +377,7 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
     )
 
     # Trend tüneli fill_between
+        # Trend tüneli fill_between
     fb = []
     if long_mask.any():
         fb.append(
@@ -383,21 +400,25 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
             )
         )
 
-    mpf.plot(
-        df,
+    plot_kwargs = dict(
         type="candle",
         style=style,
         addplot=apds if apds else None,
         volume=True,
         figratio=(16, 9),
         figscale=1.2,
-        title=f"",
+        title="",
         ylabel="Fiyat",
         ylabel_lower="Hacim",
         tight_layout=True,
         datetime_format="%m-%d %H:%M",
-        fill_between=fb if fb else None,
     )
+
+    if fb:  # boş değilse ekle
+        plot_kwargs["fill_between"] = fb
+
+    mpf.plot(df, **plot_kwargs)
+
 
 
 # ======================
@@ -405,8 +426,8 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
 # ======================
 
 def main():
-    symbol = "AVAXUSDT"
-    interval = "4h"
+    symbol = "BTCUSDT"
+    interval = "15m"
 
     df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=100)
 

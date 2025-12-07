@@ -16,22 +16,23 @@ def find_swings(
     lows: Sequence[float],
     left_bars: int = 3,
     right_bars: int = 3,
-    min_distance: Optional[int] = None,        # aynı tip (LH-LH / LB-LB) için
-    alt_min_distance: Optional[int] = None,    # farklı tip (LH-LB / LB-LH) için
+    min_distance: Optional[int] = None,        # artık kullanılmıyor, imza için duruyor
+    alt_min_distance: Optional[int] = None,    # artık kullanılmıyor, imza için duruyor
 ) -> List[SwingPoint]:
     """
     highs, lows     : mumların HIGH ve LOW değerleri
     left_bars       : pivot saymak için solda bakılacak bar sayısı
     right_bars      : pivot saymak için sağda bakılacak bar sayısı
 
-    min_distance    : AYNI tip pivotlar (LH-LH veya LB-LB) arasında
-                      olması gereken minimum bar mesafesi.
-                      Bu mesafeden daha yakınlarsa daha 'uç' pivot kalır.
-
-    alt_min_distance: FARKLI tip pivotlar (LH-LB, LB-LH) arasında
-                      uygulanacak, genellikle ÇOK DAHA KÜÇÜK mesafe.
-                      None ise, farklı tip pivotlar için seyreltme YAPILMAZ.
+    Yeni kural:
+    - Önce klasik şekilde bütün LH / LB pivotlarını çıkar.
+    - Sonra:
+        * Eğer art arda birden fazla LH varsa,
+          bu aralıktaki en yüksek fiyatlı LH'yi seç, diğer LH'leri sil.
+        * Eğer art arda birden fazla LB varsa,
+          bu aralıktaki en düşük fiyatlı LB'yi seç, diğer LB'leri sil.
     """
+
     h_arr = np.asarray(highs, dtype=float)
     l_arr = np.asarray(lows, dtype=float)
     n = len(h_arr)
@@ -61,49 +62,43 @@ def find_swings(
         if is_pivot_low:
             swings.append(SwingPoint(index=i, price=low, kind="LB"))
 
+    # Index'e göre sırala (zaman)
     swings.sort(key=lambda sp: sp.index)
 
-    # Eğer hiç seyreltme parametresi yoksa, ham pivotları dön
-    if (min_distance is None or min_distance <= 0) and \
-       (alt_min_distance is None or alt_min_distance <= 0):
-        return swings
+    if not swings:
+        return []
 
-    # --- 2) Seyreltme filtresi ---
-    filtered: List[SwingPoint] = []
-    for sp in swings:
-        if not filtered:
-            filtered.append(sp)
-            continue
+    # --- 2) Aynı tip ardışık pivot gruplarını "en uç" pivot ile birleştir ---
+    grouped: List[SwingPoint] = []
 
-        last = filtered[-1]
-        bar_dist = sp.index - last.index
+    current_kind = swings[0].kind
+    current_group: List[SwingPoint] = [swings[0]]
 
-        if sp.kind == last.kind:
-            # AYNI TİP pivotlar (LH-LH veya LB-LB)
-            if min_distance is not None and min_distance > 0 and bar_dist < min_distance:
-                # daha 'uç' olan pivot kalsın
-                if sp.kind == "LH":
-                    if sp.price > last.price:
-                        filtered[-1] = sp
-                else:  # LB
-                    if sp.price < last.price:
-                        filtered[-1] = sp
-                # yenisini eklemiyoruz
-                continue
-            else:
-                # yeterince uzakta, ikisi de mantıklı
-                filtered.append(sp)
+    for sp in swings[1:]:
+        if sp.kind == current_kind:
+            # Aynı tip -> aynı gruba ekle
+            current_group.append(sp)
         else:
-            # FARKLI TİP pivotlar (LH-LB veya LB-LH)
-            if alt_min_distance is not None and alt_min_distance > 0:
-                if bar_dist < alt_min_distance:
-                    # çok çok dibine yapışmışsa, istersek hafif filtre uygularız
-                    # burada sade davranalım: last'i koruyup yeniyi at
-                    continue
-                else:
-                    filtered.append(sp)
-            else:
-                # alt_min_distance yoksa → farklı tip pivotlarda seyreltme YOK
-                filtered.append(sp)
+            # Farklı tipe geçtik: mevcut grubu kapat
+            if current_kind == "LH":
+                # Grup içindeki en yüksek tepe
+                best = max(current_group, key=lambda s: s.price)
+            else:  # "LB"
+                # Grup içindeki en düşük dip
+                best = min(current_group, key=lambda s: s.price)
 
-    return filtered
+            grouped.append(best)
+
+            # Yeni grup başlat
+            current_kind = sp.kind
+            current_group = [sp]
+
+    # Son grubu da flush et
+    if current_group:
+        if current_kind == "LH":
+            best = max(current_group, key=lambda s: s.price)
+        else:
+            best = min(current_group, key=lambda s: s.price)
+        grouped.append(best)
+
+    return grouped
