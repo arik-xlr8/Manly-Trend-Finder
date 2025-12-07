@@ -83,6 +83,35 @@ def generate_trades(
     stop_buffer_pct: float = 0.0,  # şimdilik kullanılmıyor ama imzayı bozmayalım
     right_bars: int = 2,           # pivot onayı için kaç bar bekleniyor (find_swings ile aynı olmalı)
 ) -> List[Trade]:
+    """
+    Trend mantığı:
+
+    - Uptrend başlangıcı:
+        İki ardışık LB var ve son LB daha yüksekse:
+            prev_lb.price < sp.price  => Higher Low
+        -> Bu pivotta (sp) uptrend başlar.
+
+    - Downtrend başlangıcı:
+        İki ardışık LH var ve son LH daha düşükse:
+            prev_lh.price > sp.price  => Lower High
+        -> Bu pivotta (sp) downtrend başlar.
+
+    Kurallar:
+
+    1) POZ YOKKEN:
+        - Uptrend sinyali (HL) gelirse LONG aç.
+        - Downtrend sinyali (LH) gelirse SHORT aç.
+
+    2) POZ AÇIKKEN:
+        - LONG açıkken sadece DOWNtrend sinyali (LH, prev_lh > sp.price) gelirse:
+            -> LONG'u kapat ve aynı mumda SHORT aç.
+        - SHORT açıkken sadece UPtrend sinyali (LB, prev_lb < sp.price) gelirse:
+            -> SHORT'u kapat ve aynı mumda LONG aç.
+
+    Yani karşıt pivot geldi diye poz kapanmıyor;
+    sadece trend değiştirecek kadar anlamlıysa kapanıyor.
+    """
+
     closes = df["Close"].values
     n = len(df)
 
@@ -105,42 +134,54 @@ def generate_trades(
         prev_lh = last_lh
 
         # ======================
-        # 1) VAR OLAN TRADE'İ KAPATMA
+        # 1) VAR OLAN TRADE'İ KAPAT / TERSİNE ÇEVİR
         # ======================
         if current_trade is not None:
-            if current_trade.direction == "long" and sp.kind == "LH":
-                exit_idx = signal_idx
+            if current_trade.direction == "long":
+                # LONG sadece gerçek bir DOWNtrend sinyalinde kapanır:
+                # -> LH ve önceki LH daha yüksek olmalı (Lower High)
+                if (
+                    sp.kind == "LH"
+                    and prev_lh is not None
+                    and prev_lh.price > sp.price
+                ):
+                    exit_idx = signal_idx
 
-                # Eğer gerçekten en az 1 bar açık kaldıysa trade'i kabul et
-                if exit_idx > current_trade.entry_index:
-                    current_trade.exit_index = exit_idx
-                    current_trade.exit_price = closes[exit_idx]
-                    current_trade.exit_reason = "long_exit_LH"
-                    trades.append(current_trade)
-                # Yoksa, entry == exit ise trade'i tamamen çöpe at
-                current_trade = None
+                    # En az 1 bar açık kaldıysa trade'i kaydedelim
+                    if exit_idx > current_trade.entry_index:
+                        current_trade.exit_index = exit_idx
+                        current_trade.exit_price = closes[exit_idx]
+                        current_trade.exit_reason = "long_exit_downtrend_LH"
+                        trades.append(current_trade)
+                    # entry == exit ise trade'i çöpe atıyoruz
+                    current_trade = None
 
-                # Aynı LH pivotu, önceki LH'den düşükse -> düşen trend -> aynı mumda SHORT aç
-                if prev_lh is not None and prev_lh.price > sp.price:
+                    # Aynı anda, bu DOWNtrend sinyaliyle SHORT açıyoruz
                     current_trade = Trade(
                         direction="short",
                         entry_index=signal_idx,
                         entry_price=closes[signal_idx],
-                        stop_level=0.0,   # şu an stop kullanmıyoruz
+                        stop_level=0.0,
                     )
 
-            elif current_trade.direction == "short" and sp.kind == "LB":
-                exit_idx = signal_idx
+            elif current_trade.direction == "short":
+                # SHORT sadece gerçek bir UPtrend sinyalinde kapanır:
+                # -> LB ve önceki LB daha düşük olmalı (Higher Low)
+                if (
+                    sp.kind == "LB"
+                    and prev_lb is not None
+                    and prev_lb.price < sp.price
+                ):
+                    exit_idx = signal_idx
 
-                if exit_idx > current_trade.entry_index:
-                    current_trade.exit_index = exit_idx
-                    current_trade.exit_price = closes[exit_idx]
-                    current_trade.exit_reason = "short_exit_LB"
-                    trades.append(current_trade)
-                current_trade = None
+                    if exit_idx > current_trade.entry_index:
+                        current_trade.exit_index = exit_idx
+                        current_trade.exit_price = closes[exit_idx]
+                        current_trade.exit_reason = "short_exit_uptrend_LB"
+                        trades.append(current_trade)
+                    current_trade = None
 
-                # Aynı LB pivotu, önceki LB'den yüksekse -> yükselen trend -> aynı mumda LONG aç
-                if prev_lb is not None and prev_lb.price < sp.price:
+                    # Aynı anda, bu UPtrend sinyaliyle LONG açıyoruz
                     current_trade = Trade(
                         direction="long",
                         entry_index=signal_idx,
@@ -153,9 +194,8 @@ def generate_trades(
         # ======================
         if current_trade is None:
             if sp.kind == "LB":
-                # Higher Low? (önceki dip daha aşağı, yenisi daha yukarı)
+                # Higher Low? (önceki dip daha aşağı, yenisi daha yukarı) -> uptrend başlıyor
                 if prev_lb is not None and prev_lb.price < sp.price:
-                    # LONG aç
                     current_trade = Trade(
                         direction="long",
                         entry_index=signal_idx,
@@ -164,9 +204,8 @@ def generate_trades(
                     )
 
             elif sp.kind == "LH":
-                # Lower High? (önceki tepe daha yukarı, yenisi daha aşağı)
+                # Lower High? (önceki tepe daha yukarı, yenisi daha aşağı) -> downtrend başlıyor
                 if prev_lh is not None and prev_lh.price > sp.price:
-                    # SHORT aç
                     current_trade = Trade(
                         direction="short",
                         entry_index=signal_idx,
@@ -186,7 +225,6 @@ def generate_trades(
     # 4) HÂLÂ AÇIK OLAN TRADE VARSA, EXIT'SİZ OLARAK EKLE
     # ======================
     if current_trade is not None:
-        # exit_index / exit_price / exit_reason = None kalacak
         trades.append(current_trade)
 
     return trades
