@@ -14,7 +14,7 @@ from typing import Literal, Optional, List
 # ======================
 
 def fetch_ohlc_from_api(
-    symbol: str = "BTCUSDT",
+    symbol: str = "ETHUSDT",
     interval: str = "15m",
     limit: int = 500,
 ) -> pd.DataFrame:
@@ -74,7 +74,37 @@ class Trade:
 
 
 # ======================
-# 3) STRATEJİ LOJİĞİ (HL / LH)
+# STOP-LOSS HELPER
+# ======================
+
+def _first_stop_hit(df: pd.DataFrame, direction: str, start_idx: int, end_idx: int, stop_level: float) -> Optional[int]:
+    """
+    (start_idx, end_idx] aralığında stop'a ilk değilen bar indexini döndürür.
+
+    LONG : Low  <= stop_level
+    SHORT: High >= stop_level
+    """
+    if end_idx <= start_idx:
+        return None
+
+    window = df.iloc[start_idx + 1 : end_idx + 1]
+    if window.empty:
+        return None
+
+    if direction == "long":
+        hits = window["Low"].values <= stop_level
+    else:
+        hits = window["High"].values >= stop_level
+
+    if not hits.any():
+        return None
+
+    first_pos = int(np.argmax(hits))  # ilk True
+    return (start_idx + 1) + first_pos
+
+
+# ======================
+# 3) STRATEJİ LOJİĞİ (HL / LH) + GREED KILLER + STOP LOSS
 # ======================
 
 def generate_trades(
@@ -82,6 +112,7 @@ def generate_trades(
     swings: List[SwingPoint],
     stop_buffer_pct: float = 0.0,  # şimdilik kullanılmıyor ama imzayı bozmayalım
     right_bars: int = 2,           # pivot onayı için kaç bar bekleniyor (find_swings ile aynı olmalı)
+    stop_loss_pct: float = 0.015,  # ✅ %1.5 stop
 ) -> List[Trade]:
     """
     Trend mantığı:
@@ -102,14 +133,16 @@ def generate_trades(
         - Uptrend sinyali (HL) gelirse LONG aç.
         - Downtrend sinyali (LH) gelirse SHORT aç.
 
-    2) POZ AÇIKKEN:
-        - LONG açıkken sadece DOWNtrend sinyali (LH, prev_lh > sp.price) gelirse:
-            -> LONG'u kapat ve aynı mumda SHORT aç.
-        - SHORT açıkken sadece UPtrend sinyali (LB, prev_lb < sp.price) gelirse:
-            -> SHORT'u kapat ve aynı mumda LONG aç.
+    2) POZ AÇIKKEN (GREED KILLER):
+        - LONG açıkken, tepe (LH) pivotu ONAYLANINCA direkt kapat.
+          Eğer bu LH aynı zamanda "Lower High" ise istersek short'a çevir.
+        - SHORT açıkken, dip (LB) pivotu ONAYLANINCA direkt kapat.
+          Eğer bu LB aynı zamanda "Higher Low" ise istersek long'a çevir.
 
-    Yani karşıt pivot geldi diye poz kapanmıyor;
-    sadece trend değiştirecek kadar anlamlıysa kapanıyor.
+    3) STOP LOSS (pivot beklemez):
+        - LONG açıkken fiyat entry'den %1.5 aşağı (Low ile) değerse anında kapanır.
+        - SHORT açıkken fiyat entry'den %1.5 yukarı (High ile) değerse anında kapanır.
+        Stop, entry'den sonraki barlarda taranır ve ilk değilen barda trade kapanır.
     """
 
     closes = df["Close"].values
@@ -134,60 +167,73 @@ def generate_trades(
         prev_lh = last_lh
 
         # ======================
-        # 1) VAR OLAN TRADE'İ KAPAT / TERSİNE ÇEVİR
+        # 0) STOP LOSS: pivotu işlemeden önce, arada stop'a değdi mi kontrol et
+        # ======================
+        if current_trade is not None:
+            stop_idx = _first_stop_hit(
+                df=df,
+                direction=current_trade.direction,
+                start_idx=current_trade.entry_index,
+                end_idx=signal_idx,
+                stop_level=current_trade.stop_level,
+            )
+            if stop_idx is not None and stop_idx > current_trade.entry_index:
+                current_trade.exit_index = stop_idx
+                current_trade.exit_price = current_trade.stop_level  # stop fill price gibi düşün
+                current_trade.exit_reason = "STOP_LOSS_1_5"
+                trades.append(current_trade)
+                current_trade = None
+                # Stop olduysa bu pivotta yeni entry aramaya devam edebiliriz (aşağıda)
+
+        # ======================
+        # 1) VAR OLAN TRADE'İ KAPAT / (OPSİYONEL) TERSİNE ÇEVİR (GREED KILLER)
         # ======================
         if current_trade is not None:
             if current_trade.direction == "long":
-                # LONG sadece gerçek bir DOWNtrend sinyalinde kapanır:
-                # -> LH ve önceki LH daha yüksek olmalı (Lower High)
-                if (
-                    sp.kind == "LH"
-                    and prev_lh is not None
-                    and prev_lh.price > sp.price
-                ):
+                # LONG: Tepe (LH) pivotu ONAYLANINCA direkt kapat (greed killer)
+                if sp.kind == "LH":
                     exit_idx = signal_idx
 
-                    # En az 1 bar açık kaldıysa trade'i kaydedelim
                     if exit_idx > current_trade.entry_index:
                         current_trade.exit_index = exit_idx
                         current_trade.exit_price = closes[exit_idx]
-                        current_trade.exit_reason = "long_exit_downtrend_LH"
+                        current_trade.exit_reason = "long_exit_peak_LH"
                         trades.append(current_trade)
-                    # entry == exit ise trade'i çöpe atıyoruz
+
                     current_trade = None
 
-                    # Aynı anda, bu DOWNtrend sinyaliyle SHORT açıyoruz
-                    current_trade = Trade(
-                        direction="short",
-                        entry_index=signal_idx,
-                        entry_price=closes[signal_idx],
-                        stop_level=0.0,
-                    )
+                    # Aynı LH aynı zamanda "downtrend" sinyaliyse (Lower High) istersek SHORT'a çevir:
+                    if (prev_lh is not None) and (prev_lh.price > sp.price):
+                        entry_price = closes[signal_idx]
+                        current_trade = Trade(
+                            direction="short",
+                            entry_index=signal_idx,
+                            entry_price=entry_price,
+                            stop_level=entry_price * (1.0 + stop_loss_pct),
+                        )
 
             elif current_trade.direction == "short":
-                # SHORT sadece gerçek bir UPtrend sinyalinde kapanır:
-                # -> LB ve önceki LB daha düşük olmalı (Higher Low)
-                if (
-                    sp.kind == "LB"
-                    and prev_lb is not None
-                    and prev_lb.price < sp.price
-                ):
+                # SHORT: Dip (LB) pivotu ONAYLANINCA direkt kapat (greed killer)
+                if sp.kind == "LB":
                     exit_idx = signal_idx
 
                     if exit_idx > current_trade.entry_index:
                         current_trade.exit_index = exit_idx
                         current_trade.exit_price = closes[exit_idx]
-                        current_trade.exit_reason = "short_exit_uptrend_LB"
+                        current_trade.exit_reason = "short_exit_dip_LB"
                         trades.append(current_trade)
+
                     current_trade = None
 
-                    # Aynı anda, bu UPtrend sinyaliyle LONG açıyoruz
-                    current_trade = Trade(
-                        direction="long",
-                        entry_index=signal_idx,
-                        entry_price=closes[signal_idx],
-                        stop_level=0.0,
-                    )
+                    # Aynı LB aynı zamanda "uptrend" sinyaliyse (Higher Low) istersek LONG'a çevir:
+                    if (prev_lb is not None) and (prev_lb.price < sp.price):
+                        entry_price = closes[signal_idx]
+                        current_trade = Trade(
+                            direction="long",
+                            entry_index=signal_idx,
+                            entry_price=entry_price,
+                            stop_level=entry_price * (1.0 - stop_loss_pct),
+                        )
 
         # ======================
         # 2) HİÇ POZ YOKKEN YENİ ENTRY ARAMA
@@ -196,21 +242,23 @@ def generate_trades(
             if sp.kind == "LB":
                 # Higher Low? (önceki dip daha aşağı, yenisi daha yukarı) -> uptrend başlıyor
                 if prev_lb is not None and prev_lb.price < sp.price:
+                    entry_price = closes[signal_idx]
                     current_trade = Trade(
                         direction="long",
                         entry_index=signal_idx,
-                        entry_price=closes[signal_idx],
-                        stop_level=0.0,
+                        entry_price=entry_price,
+                        stop_level=entry_price * (1.0 - stop_loss_pct),
                     )
 
             elif sp.kind == "LH":
                 # Lower High? (önceki tepe daha yukarı, yenisi daha aşağı) -> downtrend başlıyor
                 if prev_lh is not None and prev_lh.price > sp.price:
+                    entry_price = closes[signal_idx]
                     current_trade = Trade(
                         direction="short",
                         entry_index=signal_idx,
-                        entry_price=closes[signal_idx],
-                        stop_level=0.0,
+                        entry_price=entry_price,
+                        stop_level=entry_price * (1.0 + stop_loss_pct),
                     )
 
         # ======================
@@ -267,7 +315,7 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
             if xi < 0 or xi >= n:
                 continue
 
-        # Güvenlik: exit <= entry ise tünel boyama (zaten generate_trades bunları filtreliyor ama dursun)
+        # Güvenlik: exit <= entry ise tünel boyama
         if xi <= ei:
             # sadece entry noktası çizilsin, tünel yok
             if tr.direction == "long":
@@ -415,7 +463,6 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
     )
 
     # Trend tüneli fill_between
-        # Trend tüneli fill_between
     fb = []
     if long_mask.any():
         fb.append(
@@ -458,13 +505,12 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
     mpf.plot(df, **plot_kwargs)
 
 
-
 # ======================
 # 5) MAIN
 # ======================
 
 def main():
-    symbol = "BTCUSDT"
+    symbol = "ETHUSDT"
     interval = "15m"
 
     df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=100)
@@ -486,14 +532,15 @@ def main():
 
     print("Pivot sayısı:", len(swings))
 
-    # stop_buffer_pct şu an kullanılmıyor ama imza uyumlu dursun
-    stop_buffer_pct = 0.0
+    stop_buffer_pct = 0.0  # şimdilik kullanılmıyor
+    stop_loss_pct = 0.015  # ✅ %1.5
 
     trades = generate_trades(
         df,
         swings,
         stop_buffer_pct=stop_buffer_pct,
         right_bars=right_bars,
+        stop_loss_pct=stop_loss_pct,
     )
 
     print("Trade sayısı:", len(trades))
