@@ -14,7 +14,7 @@ from typing import Literal, Optional, List
 # ======================
 
 def fetch_ohlc_from_api(
-    symbol: str = "BTCUSDT",
+    symbol: str = "TRXUSDT",
     interval: str = "15m",
     limit: int = 500,
 ) -> pd.DataFrame:
@@ -464,7 +464,7 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
 # ======================
 
 def main():
-    symbol = "BTCUSDT"
+    symbol ="TRXUSDT"
     interval = "15m"
 
     df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=100)
