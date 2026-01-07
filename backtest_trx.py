@@ -55,13 +55,18 @@ def fetch_klines_chunk(symbol: str, interval: str, start_ms: int, limit: int = 1
     df.columns = ["Open", "High", "Low", "Close", "Volume"]
     return df
 
-def fetch_ohlc_1y(symbol: str, interval: str, end_utc: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+
+def fetch_ohlc_years(symbol: str, interval: str, years: int = 3, end_utc: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """
+    Binance Futures Klines ile belirtilen yıl kadar geçmiş OHLC çeker.
+    Chunk'lı çektiği için 3 yıl gibi uzun aralıklarda da çalışır.
+    """
     if end_utc is None:
         # pandas sürümlerinde utcnow tz-aware gelebiliyor -> localize yapmıyoruz
         end_utc = pd.Timestamp.utcnow()
     end_utc = _to_utc(end_utc)
 
-    start_utc = end_utc - pd.Timedelta(days=365)
+    start_utc = end_utc - pd.Timedelta(days=365 * years)
     start_ms = _ms(start_utc)
 
     out = []
@@ -74,6 +79,7 @@ def fetch_ohlc_1y(symbol: str, interval: str, end_utc: Optional[pd.Timestamp] = 
         last_open_ms = int(chunk.index[-1].value // 10**6)
         start_ms = last_open_ms + 1
 
+        # rate limit'e takılmamak için küçük uyku
         time.sleep(0.05)
 
         if chunk.index[-1] >= end_utc:
@@ -87,7 +93,12 @@ def fetch_ohlc_1y(symbol: str, interval: str, end_utc: Optional[pd.Timestamp] = 
     df = df[(df.index >= start_utc) & (df.index <= end_utc)]
     return df
 
+
 def fetch_funding_rates(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Binance Futures funding rate history.
+    (Not: Bu endpoint bazı sembollerde eski datayı sınırlayabilir; yine de mümkün olanı çeker.)
+    """
     url = f"{BINANCE_FAPI}/fapi/v1/fundingRate"
 
     rows = []
@@ -530,6 +541,9 @@ def main():
     interval = "15m"
     right_bars = 1
 
+    # ✅ kaç yıl test etmek istiyorsun?
+    years = 5
+
     start_balance = 1000.0
     leverage = 10.0
 
@@ -547,8 +561,8 @@ def main():
     stop_loss_pct = 0.015
     enable_flip = True
 
-    print("1) OHLC çekiliyor...")
-    df = fetch_ohlc_1y(symbol, interval)
+    print(f"1) OHLC çekiliyor... (years={years})")
+    df = fetch_ohlc_years(symbol, interval, years=years)
     print(f"OHLC bars: {len(df)} | Range: {df.index[0]} -> {df.index[-1]}")
 
     highs = df["High"].values
