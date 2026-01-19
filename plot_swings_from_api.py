@@ -39,7 +39,7 @@ def fetch_ohlc_from_api(symbol: str = "TRXUSDT", interval: str = "15m", limit: i
 
 
 # ======================
-# 2) TRADE YAPISI
+# 2) TRADE YAPISI (+ FIB)
 # ======================
 
 @dataclass
@@ -52,224 +52,218 @@ class Trade:
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
 
+    # Fib trade açılırken 1 kere hesaplanır ve trade kapanana kadar SABİT kalır
+    fib_levels: Optional[List[Tuple[str, float]]] = None
+    fib_start_index: Optional[int] = None  # LL3/HH3 pivot bar index (çizgiler buradan başlar)
+
 
 # ======================
-# 2.5) UP-TREND FIB (LB2 -> LH2 -> LB3)
+# 3) FIB ORANLARI (SENİN İSTEDİĞİN)
 # ======================
 
-@dataclass
-class UptrendFib:
-    fib_id: int
-    lb2_index: int
-    lb2_price: float
-    lh2_index: int
-    lh2_price: float
-    lb3_index: int
-    lb3_price: float
-    levels: List[Tuple[str, float]]
+UPTREND_FIB_RATIOS = [-2.618, -1.618, -1.0, -1.5, 0.0, 0.5, 1.5, 2.5, 3.6, 4.5]
+DOWNTREND_FIB_RATIOS = [3.5, 2.5, 1.5, 1.0, 0.0, -0.5, -1.5, -2.5, -3.6, -4.5]
 
 
-def compute_uptrend_fib_levels(lb2: float, lh2: float) -> List[Tuple[str, float]]:
-    rng = lh2 - lb2
+def get_pivot_anchor_price(df: pd.DataFrame, pivot_idx: int, pivot_kind: str) -> float:
+    """
+    Yeni kural:
+      - pivot dip (LB / LL3) -> anchor = o mumun LOW'u
+      - pivot tepe (LH / HH3) -> anchor = o mumun HIGH'ı
+    """
+    if pivot_kind == "LB":
+        return float(df["Low"].iloc[pivot_idx])
+    return float(df["High"].iloc[pivot_idx])  # "LH"
+
+
+def compute_long_fib_from_ll3(anchor_ll3: float, target_lh2: float) -> List[Tuple[str, float]]:
+    """
+    YÜKSELEN:
+      0 = LL3 (LB3 pivot mumunun LOW'u)
+      rng = LH2 - LL3
+      level = LL3 + rng * ratio
+    """
+    rng = target_lh2 - anchor_ll3
     if rng <= 0:
         return []
 
-    retr = [0.236, 0.382, 0.5, 0.618, 0.786]
-    ext  = [1.0, 1.272, 1.618]
-
     levels: List[Tuple[str, float]] = []
-    levels.append(("0.000 (LH2)", lh2))
-    for r in retr:
-        levels.append((f"{r:.3f}", lh2 - rng * r))
-    levels.append(("1.000 (LB2)", lb2))
-    for e in ext:
-        levels.append((f"ext {e:.3f}", lh2 + rng * (e - 1.0)))
+    for r in UPTREND_FIB_RATIOS:
+        levels.append((f"{r:g}", anchor_ll3 + rng * r))
     return levels
 
 
-def find_uptrend_fibs(swings: List[SwingPoint]) -> List[UptrendFib]:
-    fibs: List[UptrendFib] = []
-    fib_id = 1
-
-    last_lb: Optional[SwingPoint] = None
-    last_lh: Optional[SwingPoint] = None
-
-    for sp in swings:
-        prev_lb = last_lb
-        prev_lh = last_lh
-
-        if sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price:
-            lb2 = prev_lb
-            lb3 = sp
-
-            if prev_lh is not None and (lb2.index < prev_lh.index < lb3.index):
-                lh2 = prev_lh
-                levels = compute_uptrend_fib_levels(lb2.price, lh2.price)
-                if levels:
-                    fibs.append(
-                        UptrendFib(
-                            fib_id=fib_id,
-                            lb2_index=lb2.index, lb2_price=lb2.price,
-                            lh2_index=lh2.index, lh2_price=lh2.price,
-                            lb3_index=lb3.index, lb3_price=lb3.price,
-                            levels=levels
-                        )
-                    )
-                    fib_id += 1
-
-        if sp.kind == "LB":
-            last_lb = sp
-        else:
-            last_lh = sp
-
-    return fibs
-
-
-# ======================
-# 2.6) DOWN-TREND FIB (LH2 -> LB2 -> LH3)
-# ======================
-
-@dataclass
-class DowntrendFib:
-    fib_id: int
-    lh2_index: int
-    lh2_price: float
-    lb2_index: int
-    lb2_price: float
-    lh3_index: int
-    lh3_price: float
-    levels: List[Tuple[str, float]]
-
-
-def compute_downtrend_fib_levels(lh2: float, lb2: float) -> List[Tuple[str, float]]:
+def compute_short_fib_from_hh3(anchor_hh3: float, target_lb2: float) -> List[Tuple[str, float]]:
     """
-    Downtrend fib:
-      Ana hareket: LH2 -> LB2 (range = lh2 - lb2)
-      Retracement (yukarı dönüş): LB2 + range * r
-      Extension (aşağı devam):    LB2 - range * (e - 1)
+    DÜŞEN:
+      0 = HH3 (LH3 pivot mumunun HIGH'ı)
+      rng = HH3 - LB2
+      level = HH3 - rng * ratio
     """
-    rng = lh2 - lb2
+    rng = anchor_hh3 - target_lb2
     if rng <= 0:
         return []
 
-    retr = [0.236, 0.382, 0.5, 0.618, 0.786]
-    ext  = [1.0, 1.272, 1.618]
-
     levels: List[Tuple[str, float]] = []
-    levels.append(("0.000 (LB2)", lb2))
-    for r in retr:
-        levels.append((f"{r:.3f}", lb2 + rng * r))
-    levels.append(("1.000 (LH2)", lh2))
-    for e in ext:
-        levels.append((f"ext {e:.3f}", lb2 - rng * (e - 1.0)))
+    for r in DOWNTREND_FIB_RATIOS:
+        levels.append((f"{r:g}", anchor_hh3 - rng * r))
     return levels
 
 
-def find_downtrend_fibs(swings: List[SwingPoint]) -> List[DowntrendFib]:
-    """
-    Senin tarifin:
-      Trend LH3'te başlar (Lower High anı).
-      Fib seti = (LH2, LB2, LH3)
-        - LH2: LH3'ten önceki tepe
-        - LB2: LH2'den sonra gelen dip
-        - LH3: LH (lower high) ile trend başlangıcı
-    """
-    fibs: List[DowntrendFib] = []
-    fib_id = 1
-
-    last_lh: Optional[SwingPoint] = None   # LH2 adayı
-    last_lb: Optional[SwingPoint] = None   # LB2 adayı (son görülen LB)
-
-    for sp in swings:
-        prev_lh = last_lh
-        prev_lb = last_lb
-
-        # Lower High yakala: LH3 geldi ve LH2'ye göre daha düşük
-        if sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price:
-            lh2 = prev_lh
-            lh3 = sp
-
-            # LB2 = LH2'den sonra gelen LB olmalı (LH2 < LB2 < LH3)
-            if prev_lb is not None and (lh2.index < prev_lb.index < lh3.index):
-                lb2 = prev_lb
-                levels = compute_downtrend_fib_levels(lh2.price, lb2.price)
-                if levels:
-                    fibs.append(
-                        DowntrendFib(
-                            fib_id=fib_id,
-                            lh2_index=lh2.index, lh2_price=lh2.price,
-                            lb2_index=lb2.index, lb2_price=lb2.price,
-                            lh3_index=lh3.index, lh3_price=lh3.price,
-                            levels=levels
-                        )
-                    )
-                    fib_id += 1
-
-        # pivot cache güncelle
-        if sp.kind == "LB":
-            last_lb = sp
-        else:
-            last_lh = sp
-
-    return fibs
-
-
 # ======================
-# 3) STRATEJİ LOJİĞİ (Aynen)
+# 4) STRATEJİ LOJİĞİ (HL / LH) + FIB TRADE'E KİLİTLİ
 # ======================
 
-def generate_trades(df: pd.DataFrame, swings: List[SwingPoint], stop_buffer_pct: float = 0.0, right_bars: int = 2) -> List[Trade]:
+def generate_trades(
+    df: pd.DataFrame,
+    swings: List[SwingPoint],
+    stop_buffer_pct: float = 0.0,  # kullanılmıyor (imza dursun)
+    right_bars: int = 2,
+) -> List[Trade]:
     closes = df["Close"].values
     n = len(df)
 
     trades: List[Trade] = []
     current_trade: Optional[Trade] = None
+
     last_lb: Optional[SwingPoint] = None
     last_lh: Optional[SwingPoint] = None
 
     for sp in swings:
         pivot_idx = sp.index
-        signal_idx = pivot_idx + right_bars
+        signal_idx = pivot_idx + right_bars  # trade giriş/çıkış barı
+
         if signal_idx >= n:
             continue
 
         prev_lb = last_lb
         prev_lh = last_lh
 
+        # ======================
+        # 1) POZ AÇIKKEN: SADECE TERS SİNYALLE KAPAT + FLIP
+        # ======================
         if current_trade is not None:
             if current_trade.direction == "long":
+                # LONG kapanma: gerçek downtrend (Lower High)
                 if sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price:
                     exit_idx = signal_idx
                     if exit_idx > current_trade.entry_index:
                         current_trade.exit_index = exit_idx
-                        current_trade.exit_price = closes[exit_idx]
+                        current_trade.exit_price = float(closes[exit_idx])
                         current_trade.exit_reason = "long_exit_downtrend_LH"
                         trades.append(current_trade)
                     current_trade = None
-                    current_trade = Trade("short", signal_idx, closes[signal_idx], 0.0)
 
-            elif current_trade.direction == "short":
+                    # Aynı anda SHORT aç: fib HH3 pivotundan
+                    entry_price = float(closes[signal_idx])
+
+                    fib_levels = None
+                    fib_start_index = None
+
+                    hh3_idx = pivot_idx  # bu pivot: LH3
+                    if 0 <= hh3_idx < n and prev_lb is not None:
+                        anchor_hh3 = get_pivot_anchor_price(df, hh3_idx, "LH")  # HIGH
+                        fib_levels = compute_short_fib_from_hh3(anchor_hh3=anchor_hh3, target_lb2=prev_lb.price)
+                        fib_start_index = hh3_idx
+
+                    current_trade = Trade(
+                        direction="short",
+                        entry_index=signal_idx,
+                        entry_price=entry_price,
+                        stop_level=0.0,
+                        fib_levels=fib_levels,
+                        fib_start_index=fib_start_index
+                    )
+
+            else:  # short
+                # SHORT kapanma: gerçek uptrend (Higher Low)
                 if sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price:
                     exit_idx = signal_idx
                     if exit_idx > current_trade.entry_index:
                         current_trade.exit_index = exit_idx
-                        current_trade.exit_price = closes[exit_idx]
+                        current_trade.exit_price = float(closes[exit_idx])
                         current_trade.exit_reason = "short_exit_uptrend_LB"
                         trades.append(current_trade)
                     current_trade = None
-                    current_trade = Trade("long", signal_idx, closes[signal_idx], 0.0)
 
+                    # Aynı anda LONG aç: fib LL3 pivotundan
+                    entry_price = float(closes[signal_idx])
+
+                    fib_levels = None
+                    fib_start_index = None
+
+                    ll3_idx = pivot_idx  # bu pivot: LB3
+                    if 0 <= ll3_idx < n and prev_lh is not None:
+                        anchor_ll3 = get_pivot_anchor_price(df, ll3_idx, "LB")  # LOW
+                        fib_levels = compute_long_fib_from_ll3(anchor_ll3=anchor_ll3, target_lh2=prev_lh.price)
+                        fib_start_index = ll3_idx
+
+                    current_trade = Trade(
+                        direction="long",
+                        entry_index=signal_idx,
+                        entry_price=entry_price,
+                        stop_level=0.0,
+                        fib_levels=fib_levels,
+                        fib_start_index=fib_start_index
+                    )
+
+        # ======================
+        # 2) POZ YOKKEN ENTRY
+        # ======================
         if current_trade is None:
+            # LONG entry: HL (Higher Low)
             if sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price:
-                current_trade = Trade("long", signal_idx, closes[signal_idx], 0.0)
-            elif sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price:
-                current_trade = Trade("short", signal_idx, closes[signal_idx], 0.0)
+                entry_price = float(closes[signal_idx])
 
+                fib_levels = None
+                fib_start_index = None
+
+                ll3_idx = pivot_idx  # LB3
+                if 0 <= ll3_idx < n and prev_lh is not None:
+                    anchor_ll3 = get_pivot_anchor_price(df, ll3_idx, "LB")  # LOW
+                    fib_levels = compute_long_fib_from_ll3(anchor_ll3=anchor_ll3, target_lh2=prev_lh.price)
+                    fib_start_index = ll3_idx
+
+                current_trade = Trade(
+                    direction="long",
+                    entry_index=signal_idx,
+                    entry_price=entry_price,
+                    stop_level=0.0,
+                    fib_levels=fib_levels,
+                    fib_start_index=fib_start_index
+                )
+
+            # SHORT entry: LH (Lower High)
+            elif sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price:
+                entry_price = float(closes[signal_idx])
+
+                fib_levels = None
+                fib_start_index = None
+
+                hh3_idx = pivot_idx  # LH3
+                if 0 <= hh3_idx < n and prev_lb is not None:
+                    anchor_hh3 = get_pivot_anchor_price(df, hh3_idx, "LH")  # HIGH
+                    fib_levels = compute_short_fib_from_hh3(anchor_hh3=anchor_hh3, target_lb2=prev_lb.price)
+                    fib_start_index = hh3_idx
+
+                current_trade = Trade(
+                    direction="short",
+                    entry_index=signal_idx,
+                    entry_price=entry_price,
+                    stop_level=0.0,
+                    fib_levels=fib_levels,
+                    fib_start_index=fib_start_index
+                )
+
+        # ======================
+        # 3) SON PİVOTLARI GÜNCELLE
+        # ======================
         if sp.kind == "LB":
             last_lb = sp
         else:
             last_lh = sp
 
+    # Açık trade kalırsa ekle
     if current_trade is not None:
         trades.append(current_trade)
 
@@ -277,12 +271,10 @@ def generate_trades(df: pd.DataFrame, swings: List[SwingPoint], stop_buffer_pct:
 
 
 # ======================
-# 4) GRAFİKTE GÖSTERME (+ UP + DOWN FIB)
+# 5) GRAFİK
 # ======================
 
-def plot_with_trades_and_fibs(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Trade],
-                             up_fibs: List[UptrendFib], down_fibs: List[DowntrendFib],
-                             symbol: str, interval: str):
+def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Trade], symbol: str, interval: str):
     n = len(df)
 
     long_mask = np.zeros(n, dtype=bool)
@@ -293,6 +285,17 @@ def plot_with_trades_and_fibs(df: pd.DataFrame, swings: List[SwingPoint], trades
     short_entry = np.full(n, np.nan)
     short_exit  = np.full(n, np.nan)
 
+    # Pivot noktaları
+    lh_series = np.full(n, np.nan)
+    lb_series = np.full(n, np.nan)
+    for sp in swings:
+        if 0 <= sp.index < n:
+            if sp.kind == "LH":
+                lh_series[sp.index] = sp.price
+            else:
+                lb_series[sp.index] = sp.price
+
+    # Trade tüneli + entry/exit
     for tr in trades:
         ei = tr.entry_index
         if ei < 0 or ei >= n:
@@ -325,50 +328,26 @@ def plot_with_trades_and_fibs(df: pd.DataFrame, swings: List[SwingPoint], trades
             if has_exit:
                 short_exit[xi] = df["Low"].iloc[xi] * 0.995
 
-    lows  = df["Low"].values
+    lows = df["Low"].values
     highs = df["High"].values
+
     long_band_low  = np.where(long_mask, lows,  np.nan)
     long_band_high = np.where(long_mask, highs, np.nan)
+
     short_band_low  = np.where(short_mask, lows,  np.nan)
     short_band_high = np.where(short_mask, highs, np.nan)
-
-    # Pivot noktaları
-    lh_series = np.full(n, np.nan)
-    lb_series = np.full(n, np.nan)
-    for sp in swings:
-        if 0 <= sp.index < n:
-            if sp.kind == "LH":
-                lh_series[sp.index] = sp.price
-            else:
-                lb_series[sp.index] = sp.price
-
-    # Up fib noktaları (LB2, LH2, LB3)
-    up_lb2 = np.full(n, np.nan)
-    up_lh2 = np.full(n, np.nan)
-    up_lb3 = np.full(n, np.nan)
-    for fb in up_fibs:
-        if 0 <= fb.lb2_index < n: up_lb2[fb.lb2_index] = fb.lb2_price
-        if 0 <= fb.lh2_index < n: up_lh2[fb.lh2_index] = fb.lh2_price
-        if 0 <= fb.lb3_index < n: up_lb3[fb.lb3_index] = fb.lb3_price
-
-    # Down fib noktaları (LH2, LB2, LH3)
-    down_lh2 = np.full(n, np.nan)
-    down_lb2 = np.full(n, np.nan)
-    down_lh3 = np.full(n, np.nan)
-    for fb in down_fibs:
-        if 0 <= fb.lh2_index < n: down_lh2[fb.lh2_index] = fb.lh2_price
-        if 0 <= fb.lb2_index < n: down_lb2[fb.lb2_index] = fb.lb2_price
-        if 0 <= fb.lh3_index < n: down_lh3[fb.lh3_index] = fb.lh3_price
 
     apds = []
     def has_data(arr: np.ndarray) -> bool:
         return np.isfinite(arr).any()
 
+    # Pivotlar
     if has_data(lh_series):
         apds.append(mpf.make_addplot(lh_series, type="scatter", markersize=50, marker="^", color="#ff9800"))
     if has_data(lb_series):
         apds.append(mpf.make_addplot(lb_series, type="scatter", markersize=50, marker="v", color="#03a9f4"))
 
+    # Trade entry/exit
     if has_data(long_entry):
         apds.append(mpf.make_addplot(long_entry, type="scatter", markersize=70, marker="o", color="#00e676"))
     if has_data(long_exit):
@@ -378,47 +357,34 @@ def plot_with_trades_and_fibs(df: pd.DataFrame, swings: List[SwingPoint], trades
     if has_data(short_exit):
         apds.append(mpf.make_addplot(short_exit, type="scatter", markersize=70, marker="o", color="#ff8a80"))
 
-    # Uptrend fib 3 noktası (büyük)
-    if has_data(up_lb2):
-        apds.append(mpf.make_addplot(up_lb2, type="scatter", markersize=140, marker="o", color="#ffd54f"))
-    if has_data(up_lh2):
-        apds.append(mpf.make_addplot(up_lh2, type="scatter", markersize=140, marker="o", color="#ffee58"))
-    if has_data(up_lb3):
-        apds.append(mpf.make_addplot(up_lb3, type="scatter", markersize=140, marker="o", color="#ffca28"))
-
-    # Downtrend fib 3 noktası (büyük) - farklı tonlar
-    if has_data(down_lh2):
-        apds.append(mpf.make_addplot(down_lh2, type="scatter", markersize=140, marker="o", color="#ffb74d"))
-    if has_data(down_lb2):
-        apds.append(mpf.make_addplot(down_lb2, type="scatter", markersize=140, marker="o", color="#ff8a80"))
-    if has_data(down_lh3):
-        apds.append(mpf.make_addplot(down_lh3, type="scatter", markersize=140, marker="o", color="#ff7043"))
-
     # Trend tüneli
-    fb_fill = []
+    fb = []
     if long_mask.any():
-        fb_fill.append(dict(y1=long_band_low, y2=long_band_high, where=long_mask, alpha=0.15, color="#00e676"))
+        fb.append(dict(y1=long_band_low, y2=long_band_high, where=long_mask, alpha=0.15, color="#00e676"))
     if short_mask.any():
-        fb_fill.append(dict(y1=short_band_low, y2=short_band_high, where=short_mask, alpha=0.15, color="#ff5252"))
+        fb.append(dict(y1=short_band_low, y2=short_band_high, where=short_mask, alpha=0.15, color="#ff5252"))
 
-    # Fib çizgileri segmentleri:
-    # Up: LB2 -> LB3
-    # Down: LH2 -> LH3
+    # Fib çizgileri: LL3/HH3 pivot barından başlar, trade kapanana kadar gider
     alines_segments = []
+    for tr in trades:
+        if not tr.fib_levels or tr.fib_start_index is None:
+            continue
 
-    for fb in up_fibs:
-        if 0 <= fb.lb2_index < n and 0 <= fb.lb3_index < n:
-            x1 = df.index[fb.lb2_index]
-            x2 = df.index[fb.lb3_index]
-            for _, price in fb.levels:
-                alines_segments.append([(x1, price), (x2, price)])
+        sidx = tr.fib_start_index
+        if sidx < 0 or sidx >= n:
+            continue
 
-    for fb in down_fibs:
-        if 0 <= fb.lh2_index < n and 0 <= fb.lh3_index < n:
-            x1 = df.index[fb.lh2_index]
-            x2 = df.index[fb.lh3_index]
-            for _, price in fb.levels:
-                alines_segments.append([(x1, price), (x2, price)])
+        x1 = df.index[sidx]
+        if tr.exit_index is None:
+            x2 = df.index[n - 1]
+        else:
+            if 0 <= tr.exit_index < n:
+                x2 = df.index[tr.exit_index]
+            else:
+                continue
+
+        for _, price in tr.fib_levels:
+            alines_segments.append([(x1, price), (x2, price)])
 
     mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", edge="inherit", wick="inherit", volume="in")
     style = mpf.make_mpf_style(
@@ -444,8 +410,8 @@ def plot_with_trades_and_fibs(df: pd.DataFrame, swings: List[SwingPoint], trades
         datetime_format="%m-%d %H:%M",
     )
 
-    if fb_fill:
-        plot_kwargs["fill_between"] = fb_fill
+    if fb:
+        plot_kwargs["fill_between"] = fb
     if alines_segments:
         plot_kwargs["alines"] = dict(alines=alines_segments, linewidths=0.7, alpha=0.45)
 
@@ -453,7 +419,7 @@ def plot_with_trades_and_fibs(df: pd.DataFrame, swings: List[SwingPoint], trades
 
 
 # ======================
-# 5) MAIN
+# 6) MAIN
 # ======================
 
 def main():
@@ -465,7 +431,7 @@ def main():
     highs = df["High"].values
     lows  = df["Low"].values
 
-    right_bars = 1
+    right_bars = 1  # find_swings ile aynı olmalı
 
     swings = find_swings(
         highs,
@@ -478,13 +444,17 @@ def main():
 
     trades = generate_trades(df, swings, stop_buffer_pct=0.0, right_bars=right_bars)
 
-    up_fibs = find_uptrend_fibs(swings)
-    down_fibs = find_downtrend_fibs(swings)
+    print("Trade sayısı:", len(trades))
+    for t in trades[-10:]:
+        print(
+            t.direction,
+            "entry:", t.entry_index,
+            "exit:", t.exit_index,
+            "fib:", "var" if t.fib_levels else "yok",
+            "fib_start:", t.fib_start_index
+        )
 
-    print("Uptrend fib set:", len(up_fibs))
-    print("Downtrend fib set:", len(down_fibs))
-
-    plot_with_trades_and_fibs(df, swings, trades, up_fibs, down_fibs, symbol, interval)
+    plot_with_trades(df, swings, trades, symbol, interval)
 
 
 if __name__ == "__main__":
