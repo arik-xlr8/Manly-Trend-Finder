@@ -1,12 +1,13 @@
+# plot_swings_from_api.py
 import requests
 import numpy as np
 import pandas as pd
 import mplfinance as mpf
 
-from swings import find_swings, SwingPoint
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional, List, Tuple
+
+from swings import find_swings, SwingPoint
 
 
 # ======================
@@ -22,9 +23,9 @@ def fetch_ohlc_from_api(symbol: str = "TRXUSDT", interval: str = "15m", limit: i
     data = resp.json()
 
     cols = [
-        "open_time","open","high","low","close","volume","close_time",
-        "quote_asset_volume","number_of_trades","taker_buy_base_volume",
-        "taker_buy_quote_volume","ignore",
+        "open_time", "open", "high", "low", "close", "volume", "close_time",
+        "quote_asset_volume", "number_of_trades", "taker_buy_base_volume",
+        "taker_buy_quote_volume", "ignore",
     ]
 
     df = pd.DataFrame(data, columns=cols)
@@ -39,8 +40,16 @@ def fetch_ohlc_from_api(symbol: str = "TRXUSDT", interval: str = "15m", limit: i
 
 
 # ======================
-# 2) TRADE YAPISI (+ FIB)
+# 2) FILLS + TRADE
 # ======================
+
+@dataclass
+class FillEvent:
+    index: int
+    qty_delta: float     # + artır / - azalt ; 0 => flatten (kalanı kapat)
+    price: float         # ham Close
+    reason: str          # "entry", "tp50_in_target", "readd50_in_target", "exit", "stop"
+
 
 @dataclass
 class Trade:
@@ -52,13 +61,27 @@ class Trade:
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
 
-    # Fib trade açılırken 1 kere hesaplanır ve trade kapanana kadar SABİT kalır
+    # Grafik için eski fib (senin ratio listelerin)
     fib_levels: Optional[List[Tuple[str, float]]] = None
-    fib_start_index: Optional[int] = None  # LL3/HH3 pivot bar index (çizgiler buradan başlar)
+    fib_start_index: Optional[int] = None
+
+    # NEW: trade bazlı 0-1 anchor (swing’den)
+    fib0_price: Optional[float] = None
+    fib1_price: Optional[float] = None
+    fib0_index: Optional[int] = None
+    fib1_index: Optional[int] = None
+
+    base_k: Optional[int] = None
+    target_k: Optional[int] = None
+
+    sold50_in_target: bool = False
+    last_action_in_target: Optional[Literal["sold50", "readd50"]] = None
+
+    fills: List[FillEvent] = field(default_factory=list)
 
 
 # ======================
-# 3) FIB ORANLARI (SENİN İSTEDİĞİN)
+# 3) FIB ORANLARI (senin istediğin)
 # ======================
 
 UPTREND_FIB_RATIOS = [-2.618, -1.618, -1.0, -1.5, 0.0, 0.5, 1.5, 2.5, 3.6, 4.5]
@@ -66,52 +89,49 @@ DOWNTREND_FIB_RATIOS = [3.5, 2.5, 1.5, 1.0, 0.0, -0.5, -1.5, -2.5, -3.6, -4.5]
 
 
 def get_pivot_anchor_price(df: pd.DataFrame, pivot_idx: int, pivot_kind: str) -> float:
-    """
-    Yeni kural:
-      - pivot dip (LB / LL3) -> anchor = o mumun LOW'u
-      - pivot tepe (LH / HH3) -> anchor = o mumun HIGH'ı
-    """
     if pivot_kind == "LB":
         return float(df["Low"].iloc[pivot_idx])
-    return float(df["High"].iloc[pivot_idx])  # "LH"
+    return float(df["High"].iloc[pivot_idx])
 
 
 def compute_long_fib_from_ll3(anchor_ll3: float, target_lh2: float) -> List[Tuple[str, float]]:
-    """
-    YÜKSELEN:
-      0 = LL3 (LB3 pivot mumunun LOW'u)
-      rng = LH2 - LL3
-      level = LL3 + rng * ratio
-    """
     rng = target_lh2 - anchor_ll3
     if rng <= 0:
         return []
-
-    levels: List[Tuple[str, float]] = []
-    for r in UPTREND_FIB_RATIOS:
-        levels.append((f"{r:g}", anchor_ll3 + rng * r))
-    return levels
+    return [(f"{r:g}", anchor_ll3 + rng * r) for r in UPTREND_FIB_RATIOS]
 
 
 def compute_short_fib_from_hh3(anchor_hh3: float, target_lb2: float) -> List[Tuple[str, float]]:
-    """
-    DÜŞEN:
-      0 = HH3 (LH3 pivot mumunun HIGH'ı)
-      rng = HH3 - LB2
-      level = HH3 - rng * ratio
-    """
     rng = anchor_hh3 - target_lb2
     if rng <= 0:
         return []
-
-    levels: List[Tuple[str, float]] = []
-    for r in DOWNTREND_FIB_RATIOS:
-        levels.append((f"{r:g}", anchor_hh3 - rng * r))
-    return levels
+    return [(f"{r:g}", anchor_hh3 - rng * r) for r in DOWNTREND_FIB_RATIOS]
 
 
 # ======================
-# 4) STRATEJİ LOJİĞİ (HL / LH) + TRAILING STOP + %3 NO-CHASE (PIVOT CLOSE -> ENTRY CLOSE)
+# 4) NEW: FIB BAND HELPERS (0-1 üzerinden band)
+# ======================
+
+def _fib_u(price: float, fib0: float, fib1: float) -> Optional[float]:
+    den = (fib1 - fib0)
+    if den == 0:
+        return None
+    return (price - fib0) / den  # u=0 fib0, u=1 fib1, u=2 => 1-2 band
+
+
+def _band_bounds_price(fib0: float, fib1: float, k: int) -> Tuple[float, float]:
+    p1 = fib0 + (fib1 - fib0) * k
+    p2 = fib0 + (fib1 - fib0) * (k + 1)
+    return (min(p1, p2), max(p1, p2))
+
+
+def _price_in_band(price: float, fib0: float, fib1: float, k: int) -> bool:
+    lo, hi = _band_bounds_price(fib0, fib1, k)
+    return lo <= price <= hi
+
+
+# ======================
+# 5) STRATEJİ LOJİĞİ
 # ======================
 
 def generate_trades(
@@ -123,7 +143,7 @@ def generate_trades(
 ) -> List[Trade]:
     closes = df["Close"].values
     highs_arr = df["High"].values
-    lows_arr  = df["Low"].values
+    lows_arr = df["Low"].values
     n = len(df)
 
     trades: List[Trade] = []
@@ -132,18 +152,15 @@ def generate_trades(
     last_lb: Optional[SwingPoint] = None
     last_lh: Optional[SwingPoint] = None
 
-    # MOD
     mode: Literal["normal", "uncertain"] = "normal"
-
     last_checked_bar = -1
 
-    # Trailing state (normal mod için)
+    # Trailing state
     long_last_high: Optional[SwingPoint] = None
     long_candidate_low: Optional[SwingPoint] = None
     short_last_low: Optional[SwingPoint] = None
     short_candidate_high: Optional[SwingPoint] = None
 
-    # Belirsiz kuralları için en son swing sinyali
     last_signal: Optional[SwingPoint] = None
 
     def reset_trailing_state():
@@ -170,13 +187,11 @@ def generate_trades(
         entry_close = float(closes[signal_idx])
         if pivot_close <= 0:
             return False
-
         if direction == "long":
             return entry_close >= pivot_close * (1.0 + max_chase_pct)
         else:
             return entry_close <= pivot_close * (1.0 - max_chase_pct)
 
-    # stop sonrası: last_signal close ile now_close arasındaki fark > max_chase_pct mi?
     def far_from_last_signal(pivot_idx: int, now_idx: int) -> bool:
         if pivot_idx < 0 or pivot_idx >= n or now_idx < 0 or now_idx >= n:
             return True
@@ -187,17 +202,103 @@ def generate_trades(
         diff = abs(now_close - pivot_close) / pivot_close
         return diff > max_chase_pct
 
+    # === NEW: fib anchors + base/target init ===
+    def init_fib_band_for_trade(tr: Trade, prev_lb: Optional[SwingPoint], prev_lh: Optional[SwingPoint]):
+        if prev_lb is None or prev_lh is None:
+            return
+
+        if tr.direction == "long":
+            if not (prev_lb.index < prev_lh.index < tr.entry_index):
+                return
+            tr.fib0_price, tr.fib1_price = float(prev_lb.price), float(prev_lh.price)
+            tr.fib0_index, tr.fib1_index = int(prev_lb.index), int(prev_lh.index)
+        else:
+            if not (prev_lh.index < prev_lb.index < tr.entry_index):
+                return
+            tr.fib0_price, tr.fib1_price = float(prev_lh.price), float(prev_lb.price)
+            tr.fib0_index, tr.fib1_index = int(prev_lh.index), int(prev_lb.index)
+
+        u = _fib_u(tr.entry_price, tr.fib0_price, tr.fib1_price)
+        if u is None:
+            return
+
+        tr.base_k = int(np.floor(u))
+        tr.target_k = tr.base_k + 1
+        tr.sold50_in_target = False
+        tr.last_action_in_target = None
+
+    # === NEW: band içinde %50 sat / %50 geri ekle ===
+    def handle_fib_band_scaling(sp: SwingPoint, pivot_idx: int, signal_idx: int):
+        nonlocal current_trade
+        tr = current_trade
+        if tr is None:
+            return
+        if tr.fib0_price is None or tr.fib1_price is None:
+            return
+        if tr.target_k is None:
+            return
+        if signal_idx <= tr.entry_index:
+            return
+
+        # swing'in fiyatı target band içinde mi?
+        if not _price_in_band(float(sp.price), tr.fib0_price, tr.fib1_price, tr.target_k):
+            return
+
+        px = float(closes[signal_idx])
+
+        if tr.direction == "long":
+            if (not tr.sold50_in_target) and sp.kind == "LH":
+                tr.fills.append(FillEvent(index=signal_idx, qty_delta=-0.5, price=px, reason="tp50_in_target"))
+                tr.sold50_in_target = True
+                tr.last_action_in_target = "sold50"
+                return
+
+            if tr.sold50_in_target and tr.last_action_in_target == "sold50" and sp.kind == "LB":
+                tr.fills.append(FillEvent(index=signal_idx, qty_delta=+0.5, price=px, reason="readd50_in_target"))
+                tr.last_action_in_target = "readd50"
+                return
+
+        else:  # short
+            if (not tr.sold50_in_target) and sp.kind == "LB":
+                tr.fills.append(FillEvent(index=signal_idx, qty_delta=+0.5, price=px, reason="tp50_in_target"))
+                tr.sold50_in_target = True
+                tr.last_action_in_target = "sold50"
+                return
+
+            if tr.sold50_in_target and tr.last_action_in_target == "sold50" and sp.kind == "LH":
+                tr.fills.append(FillEvent(index=signal_idx, qty_delta=-0.5, price=px, reason="readd50_in_target"))
+                tr.last_action_in_target = "readd50"
+                return
+
+    def add_entry_fill(tr: Trade):
+        # full poz aç
+        tr.fills.append(FillEvent(
+            index=tr.entry_index,
+            qty_delta=(+1.0 if tr.direction == "long" else -1.0),
+            price=float(closes[tr.entry_index]),
+            reason="entry"
+        ))
+
+    def add_flatten_fill(tr: Trade, idx: int, reason: str):
+        # kalan qty'yi kapat (sim flatten yapacak)
+        tr.fills.append(FillEvent(
+            index=idx,
+            qty_delta=0.0,
+            price=float(closes[idx]) if 0 <= idx < n else float(tr.entry_price),
+            reason=reason
+        ))
+
     def open_uncertain_trade_by_signal(signal: SwingPoint, entry_idx: int):
         nonlocal current_trade
         if entry_idx < 0 or entry_idx >= n:
             return
 
         if signal.kind == "LH":
-            direction: Literal["long","short"] = "short"
-            stop_level = float(df["High"].iloc[signal.index])  # stop = son tepe iğnesi
+            direction: Literal["long", "short"] = "short"
+            stop_level = float(df["High"].iloc[signal.index])
         else:
             direction = "long"
-            stop_level = float(df["Low"].iloc[signal.index])   # stop = son dip iğnesi
+            stop_level = float(df["Low"].iloc[signal.index])
 
         current_trade = Trade(
             direction=direction,
@@ -207,16 +308,14 @@ def generate_trades(
             fib_levels=None,
             fib_start_index=None
         )
+        add_entry_fill(current_trade)
         reset_trailing_state()
 
     def try_uncertain_entry_after_stop(now_idx: int):
-        nonlocal current_trade, mode
         if last_signal is None:
             return
-        # max_chase_pct'ten fazlaysa hiçbir şey yapma
         if far_from_last_signal(last_signal.index, now_idx):
             return
-        # değilse son sinyale göre giriş
         open_uncertain_trade_by_signal(last_signal, now_idx)
 
     for sp in swings:
@@ -236,19 +335,17 @@ def generate_trades(
             end_i = signal_idx
             for i in range(start_i, end_i + 1):
                 if stop_hit_on_bar(current_trade, i):
-                    # stop -> trade kapanır
                     current_trade.exit_index = i
                     current_trade.exit_price = stop_exit_price(current_trade)
-                    current_trade.exit_reason = "stop_hit_uncertain"
-                    trades.append(current_trade)
+                    current_trade.exit_reason = "stop_hit"
 
+                    add_flatten_fill(current_trade, i, reason="stop")
+
+                    trades.append(current_trade)
                     current_trade = None
                     reset_trailing_state()
 
-                    # belirsiz moda gir
                     mode = "uncertain"
-
-                    # stop olduktan hemen sonra kural: last_signal-close vs now-close
                     try_uncertain_entry_after_stop(now_idx=i)
 
                     last_checked_bar = i
@@ -257,40 +354,31 @@ def generate_trades(
         last_checked_bar = max(last_checked_bar, signal_idx)
 
         # ==================================================
-        # B) BELİRSİZ MOD
-        #    - HL/LH confirm olana kadar pivotlara göre flip
-        #    - Ama flip/entry %3 filtresinden geçmeli (pivot close -> entry close)
+        # B) BELİRSİZ MOD (fib yok)
         # ==================================================
         if mode == "uncertain":
-            uptrend_confirm = (sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price)   # HL
-            downtrend_confirm = (sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price) # LH
+            uptrend_confirm = (sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price)
+            downtrend_confirm = (sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price)
 
             if uptrend_confirm or downtrend_confirm:
-                # belirsiz bitti -> normal moda dön, bu pivotu normal mantık işleyecek
                 mode = "normal"
             else:
-                desired: Literal["long","short"] = "long" if sp.kind == "LB" else "short"
+                desired: Literal["long", "short"] = "long" if sp.kind == "LB" else "short"
 
-                # %3 filtresi: pivot close -> entry close (belirsizde de aktif!)
-                if chase_too_much(desired, pivot_idx, signal_idx):
-                    # hiçbir şey yapma (pozisyonu koru)
-                    # pivot update aşağıda
-                    pass
-                else:
-                    # flip gerekiyorsa signal_idx'te kapat + yeni yön aç
-                    if current_trade is not None:
-                        if current_trade.direction != desired:
-                            exit_idx = signal_idx
-                            if exit_idx > current_trade.entry_index:
-                                current_trade.exit_index = exit_idx
-                                current_trade.exit_price = float(closes[exit_idx])
-                                current_trade.exit_reason = "uncertain_flip"
-                                trades.append(current_trade)
-                            current_trade = None
-                            reset_trailing_state()
+                if not chase_too_much(desired, pivot_idx, signal_idx):
+                    if current_trade is not None and current_trade.direction != desired:
+                        exit_idx = signal_idx
+                        if exit_idx > current_trade.entry_index:
+                            current_trade.exit_index = exit_idx
+                            current_trade.exit_price = float(closes[exit_idx])
+                            current_trade.exit_reason = "uncertain_flip"
+                            add_flatten_fill(current_trade, exit_idx, reason="exit")
+                            trades.append(current_trade)
+
+                        current_trade = None
+                        reset_trailing_state()
 
                     if current_trade is None:
-                        # belirsiz trade stop'u = bu pivotun iğnesi
                         stop_level = pivot_stop_level(pivot_idx, "LB" if desired == "long" else "LH")
                         current_trade = Trade(
                             direction=desired,
@@ -300,9 +388,9 @@ def generate_trades(
                             fib_levels=None,
                             fib_start_index=None
                         )
+                        add_entry_fill(current_trade)
                         reset_trailing_state()
 
-                # belirsizde normal akışa girmesin
                 last_signal = sp
                 if sp.kind == "LB":
                     last_lb = sp
@@ -311,10 +399,14 @@ def generate_trades(
                 continue
 
         # ==================================================
-        # C) NORMAL MOD (senin eski sistemin)
+        # C) NORMAL MOD
         # ==================================================
 
-        # Trailing stop güncelle (değişmedi)
+        # NEW: band scaling (trade açıkken)
+        if current_trade is not None:
+            handle_fib_band_scaling(sp, pivot_idx, signal_idx)
+
+        # Trailing stop (senin eski mantık)
         if current_trade is not None:
             if current_trade.direction == "long":
                 if sp.kind == "LH":
@@ -349,7 +441,7 @@ def generate_trades(
                     if short_last_low is not None and sp.index > short_last_low.index:
                         short_candidate_high = sp
 
-        # 1) poz açıkken ters sinyalle kapat + flip
+        # 1) poz açıkken ters sinyal -> kapat + flip
         if current_trade is not None:
             if current_trade.direction == "long":
                 if sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price:
@@ -358,10 +450,13 @@ def generate_trades(
                         current_trade.exit_index = exit_idx
                         current_trade.exit_price = float(closes[exit_idx])
                         current_trade.exit_reason = "long_exit_downtrend_LH"
+                        add_flatten_fill(current_trade, exit_idx, reason="exit")
                         trades.append(current_trade)
+
                     current_trade = None
                     reset_trailing_state()
 
+                    # flip short
                     if not chase_too_much("short", pivot_idx, signal_idx):
                         entry_price = float(closes[signal_idx])
 
@@ -382,19 +477,24 @@ def generate_trades(
                             fib_levels=fib_levels,
                             fib_start_index=fib_start_index
                         )
+                        add_entry_fill(current_trade)
+                        init_fib_band_for_trade(current_trade, prev_lb=prev_lb, prev_lh=prev_lh)
                         reset_trailing_state()
 
-            else:
+            else:  # short
                 if sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price:
                     exit_idx = signal_idx
                     if exit_idx > current_trade.entry_index:
                         current_trade.exit_index = exit_idx
                         current_trade.exit_price = float(closes[exit_idx])
                         current_trade.exit_reason = "short_exit_uptrend_LB"
+                        add_flatten_fill(current_trade, exit_idx, reason="exit")
                         trades.append(current_trade)
+
                     current_trade = None
                     reset_trailing_state()
 
+                    # flip long
                     if not chase_too_much("long", pivot_idx, signal_idx):
                         entry_price = float(closes[signal_idx])
 
@@ -415,10 +515,13 @@ def generate_trades(
                             fib_levels=fib_levels,
                             fib_start_index=fib_start_index
                         )
+                        add_entry_fill(current_trade)
+                        init_fib_band_for_trade(current_trade, prev_lb=prev_lb, prev_lh=prev_lh)
                         reset_trailing_state()
 
         # 2) poz yokken entry
         if current_trade is None:
+            # long entry: HL
             if sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price:
                 if not chase_too_much("long", pivot_idx, signal_idx):
                     entry_price = float(closes[signal_idx])
@@ -440,8 +543,11 @@ def generate_trades(
                         fib_levels=fib_levels,
                         fib_start_index=fib_start_index
                     )
+                    add_entry_fill(current_trade)
+                    init_fib_band_for_trade(current_trade, prev_lb=prev_lb, prev_lh=prev_lh)
                     reset_trailing_state()
 
+            # short entry: LH lower-high
             elif sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price:
                 if not chase_too_much("short", pivot_idx, signal_idx):
                     entry_price = float(closes[signal_idx])
@@ -463,10 +569,12 @@ def generate_trades(
                         fib_levels=fib_levels,
                         fib_start_index=fib_start_index
                     )
+                    add_entry_fill(current_trade)
+                    init_fib_band_for_trade(current_trade, prev_lb=prev_lb, prev_lh=prev_lh)
                     reset_trailing_state()
 
         # ==================================================
-        # D) Pivot / last_signal update
+        # D) Pivot update
         # ==================================================
         last_signal = sp
         if sp.kind == "LB":
@@ -474,7 +582,7 @@ def generate_trades(
         else:
             last_lh = sp
 
-    # sonda açık trade varsa ekle (istersen burada da stop taraması eklenebilir)
+    # sonda açık trade varsa ekle (exit yoksa backtest onu görmez)
     if current_trade is not None:
         trades.append(current_trade)
 
@@ -482,7 +590,7 @@ def generate_trades(
 
 
 # ======================
-# 5) GRAFİK
+# 6) GRAFİK
 # ======================
 
 def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Trade], symbol: str, interval: str):
@@ -491,12 +599,6 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
     long_mask = np.zeros(n, dtype=bool)
     short_mask = np.zeros(n, dtype=bool)
 
-    long_entry  = np.full(n, np.nan)
-    long_exit   = np.full(n, np.nan)
-    short_entry = np.full(n, np.nan)
-    short_exit  = np.full(n, np.nan)
-
-    # Pivot noktaları
     lh_series = np.full(n, np.nan)
     lb_series = np.full(n, np.nan)
     for sp in swings:
@@ -506,76 +608,50 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
             else:
                 lb_series[sp.index] = sp.price
 
-    # Trade tüneli + entry/exit
     for tr in trades:
         ei = tr.entry_index
         if ei < 0 or ei >= n:
             continue
 
         if tr.exit_index is None:
-            has_exit = False
             xi = n - 1
         else:
-            has_exit = True
             xi = tr.exit_index
             if xi < 0 or xi >= n:
                 continue
 
         if xi <= ei:
-            if tr.direction == "long":
-                long_entry[ei] = df["Low"].iloc[ei] * 0.995
-            else:
-                short_entry[ei] = df["High"].iloc[ei] * 1.005
             continue
 
         if tr.direction == "long":
             long_mask[ei:xi+1] = True
-            long_entry[ei] = df["Low"].iloc[ei] * 0.995
-            if has_exit:
-                long_exit[xi] = df["High"].iloc[xi] * 1.005
         else:
             short_mask[ei:xi+1] = True
-            short_entry[ei] = df["High"].iloc[ei] * 1.005
-            if has_exit:
-                short_exit[xi] = df["Low"].iloc[xi] * 0.995
 
     lows = df["Low"].values
     highs = df["High"].values
 
-    long_band_low  = np.where(long_mask, lows,  np.nan)
+    long_band_low = np.where(long_mask, lows, np.nan)
     long_band_high = np.where(long_mask, highs, np.nan)
-
-    short_band_low  = np.where(short_mask, lows,  np.nan)
+    short_band_low = np.where(short_mask, lows, np.nan)
     short_band_high = np.where(short_mask, highs, np.nan)
 
     apds = []
+
     def has_data(arr: np.ndarray) -> bool:
         return np.isfinite(arr).any()
 
-    # Pivotlar
     if has_data(lh_series):
         apds.append(mpf.make_addplot(lh_series, type="scatter", markersize=50, marker="^", color="#ff9800"))
     if has_data(lb_series):
         apds.append(mpf.make_addplot(lb_series, type="scatter", markersize=50, marker="v", color="#03a9f4"))
 
-    # # Trade entry/exit
-    # if has_data(long_entry):
-    #     apds.append(mpf.make_addplot(long_entry, type="scatter", markersize=70, marker="o", color="#00e676"))
-    # if has_data(long_exit):
-    #     apds.append(mpf.make_addplot(long_exit, type="scatter", markersize=70, marker="o", color="#1de9b6"))
-    # if has_data(short_entry):
-    #     apds.append(mpf.make_addplot(short_entry, type="scatter", markersize=70, marker="o", color="#ff5252"))
-    # if has_data(short_exit):
-    #     apds.append(mpf.make_addplot(short_exit, type="scatter", markersize=70, marker="o", color="#ff8a80"))
-
-    # Trend tüneli
     fb = []
     if long_mask.any():
         fb.append(dict(y1=long_band_low, y2=long_band_high, where=long_mask, alpha=0.15, color="#00e676"))
     if short_mask.any():
         fb.append(dict(y1=short_band_low, y2=short_band_high, where=short_mask, alpha=0.15, color="#ff5252"))
 
-    # Fib çizgileri: LL3/HH3 pivot barından başlar, trade kapanana kadar gider
     alines_segments = []
     for tr in trades:
         if not tr.fib_levels or tr.fib_start_index is None:
@@ -630,7 +706,7 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
 
 
 # ======================
-# 6) MAIN
+# 7) MAIN (debug plot)
 # ======================
 
 def main():
@@ -640,9 +716,9 @@ def main():
     df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=200)
 
     highs = df["High"].values
-    lows  = df["Low"].values
+    lows = df["Low"].values
 
-    right_bars = 1  # find_swings ile aynı olmalı
+    right_bars = 1
 
     swings = find_swings(
         highs,
@@ -663,8 +739,9 @@ def main():
             "exit:", t.exit_index,
             "stop:", round(t.stop_level, 6),
             "exit_reason:", t.exit_reason,
-            "fib:", "var" if t.fib_levels else "yok",
-            "fib_start:", t.fib_start_index
+            "fills:", len(t.fills),
+            "base:", t.base_k,
+            "target:", t.target_k,
         )
 
     plot_with_trades(df, swings, trades, symbol, interval)

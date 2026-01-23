@@ -1,3 +1,4 @@
+# swings.py
 from dataclasses import dataclass
 from typing import List, Literal, Sequence, Optional
 
@@ -6,9 +7,9 @@ import numpy as np
 
 @dataclass
 class SwingPoint:
-    index: int          # hangi mum
-    price: float        # o mumun (iğnenin) fiyatı
-    kind: Literal["LH", "LB"]  # Local High / Local Bottom (pivot high / low)
+    index: int
+    price: float
+    kind: Literal["LH", "LB"]  # Local High / Local Bottom
 
 
 def find_swings(
@@ -47,22 +48,20 @@ def find_swings(
         high = h_arr[i]
         low = l_arr[i]
 
-        left_h = h_arr[i - left_bars : i]
-        right_h = h_arr[i + 1 : i + 1 + right_bars]
+        left_h = h_arr[i - left_bars: i]
+        right_h = h_arr[i + 1: i + 1 + right_bars]
 
-        left_l = l_arr[i - left_bars : i]
-        right_l = l_arr[i + 1 : i + 1 + right_bars]
+        left_l = l_arr[i - left_bars: i]
+        right_l = l_arr[i + 1: i + 1 + right_bars]
 
         is_pivot_high = np.all(high >= left_h) and np.all(high >= right_h)
-        is_pivot_low  = np.all(low  <= left_l) and np.all(low  <= right_l)
+        is_pivot_low = np.all(low <= left_l) and np.all(low <= right_l)
 
         if is_pivot_high:
-            swings.append(SwingPoint(index=i, price=high, kind="LH"))
-
+            swings.append(SwingPoint(index=i, price=float(high), kind="LH"))
         if is_pivot_low:
-            swings.append(SwingPoint(index=i, price=low, kind="LB"))
+            swings.append(SwingPoint(index=i, price=float(low), kind="LB"))
 
-    # Index'e göre sırala (zaman)
     swings.sort(key=lambda sp: sp.index)
 
     if not swings:
@@ -76,24 +75,17 @@ def find_swings(
 
     for sp in swings[1:]:
         if sp.kind == current_kind:
-            # Aynı tip -> aynı gruba ekle
             current_group.append(sp)
         else:
-            # Farklı tipe geçtik: mevcut grubu kapat
             if current_kind == "LH":
-                # Grup içindeki en yüksek tepe
                 best = max(current_group, key=lambda s: s.price)
-            else:  # "LB"
-                # Grup içindeki en düşük dip
+            else:
                 best = min(current_group, key=lambda s: s.price)
 
             grouped.append(best)
-
-            # Yeni grup başlat
             current_kind = sp.kind
             current_group = [sp]
 
-    # Son grubu da flush et
     if current_group:
         if current_kind == "LH":
             best = max(current_group, key=lambda s: s.price)
