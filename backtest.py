@@ -2,13 +2,13 @@
 import requests
 import pandas as pd
 import numpy as np
+
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Any
 from datetime import datetime, timedelta, timezone
 
 from plot_swings_from_api import generate_trades  # en güncel strateji (fills'li)
 from swings import find_swings
-
 
 # ======================
 # 1) BINANCE API HELPERS
@@ -23,18 +23,26 @@ def _get(url: str, params: Dict[str, Any]):
 
 
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Binance Futures klines: [open_time, open, high, low, close, volume, ...]
+    """
     out = []
     limit = 1500
     url = f"{BASE}/fapi/v1/klines"
 
     t = start_ms
     while True:
-        data = _get(url, {"symbol": symbol, "interval": interval, "startTime": t, "endTime": end_ms, "limit": limit})
+        data = _get(
+            url,
+            {"symbol": symbol, "interval": interval, "startTime": t, "endTime": end_ms, "limit": limit},
+        )
         if not data:
             break
+
         out.extend(data)
         last_open = int(data[-1][0])
         t = last_open + 1
+
         if len(data) < limit:
             break
         if last_open >= end_ms:
@@ -58,15 +66,21 @@ def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.D
 
 
 def fetch_funding_rates(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Binance Futures fundingRate endpoint.
+    fundingTime, fundingRate
+    """
     url = f"{BASE}/fapi/v1/fundingRate"
     limit = 1000
     all_rows = []
     t = start_ms
+
     while True:
         rows = _get(url, {"symbol": symbol, "startTime": t, "endTime": end_ms, "limit": limit})
         if not rows:
             break
         all_rows.extend(rows)
+
         last_time = int(rows[-1]["fundingTime"])
         t = last_time + 1
         if len(rows) < limit:
@@ -121,6 +135,18 @@ def apply_exit_slippage(direction: str, price: float, slip: float) -> float:
         return price * (1.0 + slip)
 
 
+def apply_stop_slippage_from_position(qty_signed: float, price: float, slip: float) -> float:
+    """
+    Stop'ta:
+      - long pozisyon stop => SELL => fiyat kötüleşir => daha aşağı
+      - short pozisyon stop => BUY  => fiyat kötüleşir => daha yukarı
+    """
+    if qty_signed > 0:  # long -> sell
+        return price * (1.0 - slip)
+    else:              # short -> buy
+        return price * (1.0 + slip)
+
+
 # ======================
 # 4) REALISTIC SIM (fills destekli)
 # ======================
@@ -142,9 +168,11 @@ def simulate_balance_realistic(
     balance = float(start_balance)
     total_fees = 0.0
     total_funding = 0.0
+
     wins = 0
     losses = 0
     closed = 0
+
     stop_hits = 0
     liquidations = 0
     exit_reason_counts: Dict[str, int] = {}
@@ -169,31 +197,36 @@ def simulate_balance_realistic(
     ) -> float:
         if f_times is None or not len(f_rates) or qty_abs <= 0:
             return 0.0
+
         mask = (f_times > t0) & (f_times <= t1)
         if not mask.any():
             return 0.0
+
         rates = f_rates[mask.values]
         # varsayım: long pays(-), short receives(+)
         sign = -1.0 if is_long else 1.0
         return float(np.sum(notional * qty_abs * rates * sign))
 
     for tr in trades:
-        if getattr(tr, "exit_index", None) is None:
+        xi_obj = getattr(tr, "exit_index", None)
+        if xi_obj is None:
             continue
 
         ei = int(tr.entry_index)
         xi = int(tr.exit_index)
+
         if ei < 0 or xi <= ei or xi >= len(df):
             continue
-
         if balance <= 0:
             break
 
         bal0 = balance
+
+        # her trade için kullanılacak margin/notional
         margin = balance * margin_pct
         if margin <= 0:
             break
-        notional_base = margin * leverage  # 1.0 fraction notional
+        notional_base = margin * leverage  # qty=1.0 notional
 
         reason = (getattr(tr, "exit_reason", None) or "unknown_exit")
         exit_reason_counts[reason] = exit_reason_counts.get(reason, 0) + 1
@@ -201,8 +234,11 @@ def simulate_balance_realistic(
             stop_hits += 1
 
         fills = getattr(tr, "fills", None)
+
+        # ------------------------------------------------------
+        # A) Fallback: fills yoksa tek entry/exit sim
+        # ------------------------------------------------------
         if not fills:
-            # fallback: tek entry/exit
             entry_time = df.index[ei]
             exit_time = df.index[xi]
 
@@ -210,6 +246,7 @@ def simulate_balance_realistic(
             raw_exit = float(tr.exit_price) if tr.exit_price is not None else float(df["Close"].iloc[xi])
 
             entry_price = apply_entry_slippage(tr.direction, raw_entry, entry_slip_pct)
+
             if "stop" in reason.lower():
                 exit_price = apply_exit_slippage(tr.direction, raw_exit, stop_slip_pct)
             else:
@@ -219,8 +256,8 @@ def simulate_balance_realistic(
             balance -= fees
             total_fees += fees
 
-            if f_times is not None and len(f_rates):
-                fp = funding_pnl_between(entry_time, exit_time, notional_base, 1.0, is_long=(tr.direction == "long"))
+            fp = funding_pnl_between(entry_time, exit_time, notional_base, 1.0, is_long=(tr.direction == "long"))
+            if fp != 0.0:
                 balance += fp
                 total_funding += fp
 
@@ -231,19 +268,22 @@ def simulate_balance_realistic(
 
             balance += pnl
             closed += 1
-            if balance > bal0:
+            if pnl > 0:
                 wins += 1
             else:
                 losses += 1
+
             equity_curve.append((exit_time, balance))
             continue
 
-        # ===== fills-based execution =====
-        events = sorted(fills, key=lambda e: e.index)
+        # ------------------------------------------------------
+        # B) fills-based execution
+        # ------------------------------------------------------
+        events = sorted(fills, key=lambda e: int(e.index))
 
-        qty = 0.0        # signed fraction (+ long, - short)
-        avg = None       # avg entry price
-        trade_pnl = 0.0  # pnl - fees + funding
+        qty = 0.0          # signed fraction (+ long, - short)
+        avg = None         # avg entry price
+        trade_pnl = 0.0    # trade bazında pnl - fee + funding
 
         last_time = df.index[ei]
 
@@ -269,27 +309,28 @@ def simulate_balance_realistic(
 
             raw_px = float(ev.price)
 
-            # flatten event mi?
-            is_flatten = (ev.reason in ("exit", "stop")) or (float(ev.qty_delta) == 0.0)
+            # flatten event mi? (exit/stop veya qty_delta=0 => flatten)
+            is_flatten = (getattr(ev, "reason", "") in ("exit", "stop")) or (float(ev.qty_delta) == 0.0)
             if is_flatten:
                 delta = -qty
             else:
                 delta = float(ev.qty_delta)
 
-            if delta == 0.0:
+            if abs(delta) < 1e-12:
                 continue
 
-            # slippage
-            if ev.reason == "stop":
-                px = apply_exit_slippage("long" if qty > 0 else "short", raw_px, stop_slip_pct)
+            # slippage seçimi
+            if getattr(ev, "reason", "") == "stop":
+                # stop'ta pozisyon yönüne göre kötüleşen fiyat
+                px = apply_stop_slippage_from_position(qty if qty != 0 else delta, raw_px, stop_slip_pct)
             else:
-                # poz aç/artar => entry slip, azalt/kapat => exit slip
+                # aç/artar => entry slip, azalt/kapat => exit slip
                 if (qty == 0.0) or (np.sign(delta) == np.sign(qty)):
                     px = apply_entry_slippage("long" if delta > 0 else "short", raw_px, entry_slip_pct)
                 else:
                     px = apply_exit_slippage("long" if qty > 0 else "short", raw_px, exit_slip_pct)
 
-            # fee (parça notional)
+            # fee: parça notional üzerinden
             fee = apply_fee(abs(delta) * notional_base, taker_fee_rate)
             balance -= fee
             total_fees += fee
@@ -298,7 +339,8 @@ def simulate_balance_realistic(
             # open/add (aynı yönde)
             if qty == 0.0 or np.sign(delta) == np.sign(qty):
                 new_qty = qty + delta
-                if new_qty == 0.0:
+
+                if abs(new_qty) < 1e-12:
                     qty = 0.0
                     avg = None
                 else:
@@ -315,10 +357,10 @@ def simulate_balance_realistic(
             if avg is None or avg <= 0:
                 avg = px
 
-            portion = abs(delta)
-            if qty > 0:  # long reduce
+            portion = abs(delta)  # kapanan fraction
+            if qty > 0:  # long reduce => sell
                 pnl = (px - avg) / avg * (portion * notional_base)
-            else:        # short reduce
+            else:        # short reduce => buy
                 pnl = (avg - px) / avg * (portion * notional_base)
 
             balance += pnl
@@ -329,12 +371,14 @@ def simulate_balance_realistic(
                 qty = 0.0
                 avg = None
 
+        # trade bitti
         closed += 1
         if trade_pnl > 0:
             wins += 1
         else:
             losses += 1
 
+        # liquidation check (kapalıysa etkisiz)
         if enable_liquidation_check:
             required_maint = notional_base * maintenance_margin_rate
             if balance <= required_maint:
@@ -366,10 +410,10 @@ def simulate_balance_realistic(
 class FibMonthStats:
     trade_count: int = 0
     trades_with_fills: int = 0
-    fib_anchor_ready: int = 0         # fib0/fib1 bulunabildi
-    fib_anchor_missing: int = 0       # fib yok
-    partial_tp50: int = 0             # %50 sat
-    readd_50: int = 0                 # %50 geri ekle
+    fib_anchor_ready: int = 0
+    fib_anchor_missing: int = 0
+    partial_tp50: int = 0
+    readd_50: int = 0
     exit_events: int = 0
     stop_events: int = 0
 
@@ -379,7 +423,6 @@ class FibMonthStats:
 
 
 def _get_trade_fib_anchors(trade: Any) -> Tuple[Optional[float], Optional[float]]:
-    # isim toleransı
     fib0 = getattr(trade, "fib0_price", None)
     fib1 = getattr(trade, "fib1_price", None)
     if fib0 is None:
@@ -391,6 +434,7 @@ def _get_trade_fib_anchors(trade: Any) -> Tuple[Optional[float], Optional[float]
 
 def compute_fib_month_stats(trades: List) -> FibMonthStats:
     st = FibMonthStats(trade_count=len(trades))
+
     for t in trades:
         fills = getattr(t, "fills", None) or []
         if fills:
@@ -404,9 +448,11 @@ def compute_fib_month_stats(trades: List) -> FibMonthStats:
 
         for ev in fills:
             r = getattr(ev, "reason", None)
-            if r == "tp50_in_target":
+
+            # ✅ STRATEJİDEKİ İSİMLERLE UYUMLU
+            if r == "tp50_band":
                 st.partial_tp50 += 1
-            elif r == "readd50_in_target":
+            elif r == "readd50_band":
                 st.readd_50 += 1
             elif r == "exit":
                 st.exit_events += 1
@@ -430,7 +476,6 @@ def merge_fib_stats(a: FibMonthStats, b: FibMonthStats) -> FibMonthStats:
 
 
 def format_fib_inline(st: FibMonthStats) -> str:
-    # daha kısa, satır içine gömülebilir
     return f"FIB[anchor={st.fib_anchor_ready}/{st.trade_count} | tp50={st.partial_tp50} | readd={st.readd_50} | actions={st.size_actions}]"
 
 
@@ -480,6 +525,7 @@ def run_symbol_monthly_reset_case(
     show_fib_each_month: bool = True,
     show_fib_symbol_summary: bool = True,
 ) -> Dict[str, Any]:
+
     month_reports: List[Dict[str, Any]] = []
 
     total_net = 0.0
@@ -562,6 +608,7 @@ def run_symbol_monthly_reset_case(
         total_losses += res.losses
         total_stop_hits += res.stop_hits
         total_liqs += res.liquidations
+
         for k, v in res.exit_reason_counts.items():
             exit_reasons[k] = exit_reasons.get(k, 0) + v
 
@@ -582,7 +629,6 @@ def run_symbol_monthly_reset_case(
         })
 
     if show_fib_symbol_summary:
-        # tek satırlık okunur özet
         print(
             f"[FIB-SUMMARY] {symbol} | "
             f"anchors_ready={fib_total.fib_anchor_ready}/{fib_total.trade_count} "

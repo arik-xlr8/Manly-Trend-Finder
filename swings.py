@@ -17,21 +17,14 @@ def find_swings(
     lows: Sequence[float],
     left_bars: int = 3,
     right_bars: int = 3,
-    min_distance: Optional[int] = None,        # artık kullanılmıyor, imza için duruyor
-    alt_min_distance: Optional[int] = None,    # artık kullanılmıyor, imza için duruyor
+    min_distance: Optional[int] = None,
+    alt_min_distance: Optional[int] = None,
 ) -> List[SwingPoint]:
     """
-    highs, lows     : mumların HIGH ve LOW değerleri
-    left_bars       : pivot saymak için solda bakılacak bar sayısı
-    right_bars      : pivot saymak için sağda bakılacak bar sayısı
-
-    Yeni kural:
-    - Önce klasik şekilde bütün LH / LB pivotlarını çıkar.
-    - Sonra:
-        * Eğer art arda birden fazla LH varsa,
-          bu aralıktaki en yüksek fiyatlı LH'yi seç, diğer LH'leri sil.
-        * Eğer art arda birden fazla LB varsa,
-          bu aralıktaki en düşük fiyatlı LB'yi seç, diğer LB'leri sil.
+    1) Ham LH/LB pivotları bul.
+    2) Ardışık aynı tip pivotları birleştir:
+       - LH grubunda en yüksek olan kalsın
+       - LB grubunda en düşük olan kalsın
     """
 
     h_arr = np.asarray(highs, dtype=float)
@@ -43,7 +36,7 @@ def find_swings(
 
     swings: List[SwingPoint] = []
 
-    # --- 1) Ham pivotları bul (left/right bar kuralına göre) ---
+    # 1) Ham pivotlar
     for i in range(left_bars, n - right_bars):
         high = h_arr[i]
         low = l_arr[i]
@@ -63,11 +56,10 @@ def find_swings(
             swings.append(SwingPoint(index=i, price=float(low), kind="LB"))
 
     swings.sort(key=lambda sp: sp.index)
-
     if not swings:
         return []
 
-    # --- 2) Aynı tip ardışık pivot gruplarını "en uç" pivot ile birleştir ---
+    # 2) Aynı tip ardışık pivotları birleştir
     grouped: List[SwingPoint] = []
 
     current_kind = swings[0].kind
@@ -77,20 +69,13 @@ def find_swings(
         if sp.kind == current_kind:
             current_group.append(sp)
         else:
-            if current_kind == "LH":
-                best = max(current_group, key=lambda s: s.price)
-            else:
-                best = min(current_group, key=lambda s: s.price)
-
+            best = max(current_group, key=lambda s: s.price) if current_kind == "LH" else min(current_group, key=lambda s: s.price)
             grouped.append(best)
             current_kind = sp.kind
             current_group = [sp]
 
     if current_group:
-        if current_kind == "LH":
-            best = max(current_group, key=lambda s: s.price)
-        else:
-            best = min(current_group, key=lambda s: s.price)
+        best = max(current_group, key=lambda s: s.price) if current_kind == "LH" else min(current_group, key=lambda s: s.price)
         grouped.append(best)
 
     return grouped
