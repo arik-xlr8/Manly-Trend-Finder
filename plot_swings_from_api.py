@@ -726,7 +726,7 @@ def main():
         alt_min_distance=None,
     )
 
-    trades = generate_trades(df, swings, stop_buffer_pct=0.0, right_bars=right_bars, max_chase_pct=0.005)
+    trades = generate_trades(df, swings, stop_buffer_pct=0.0, right_bars=right_bars, max_chase_pct=0.03)
 
     print("Trade sayısı:", len(trades))
     for t in trades[-10:]:
