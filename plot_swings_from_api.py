@@ -4,6 +4,12 @@ import numpy as np
 import pandas as pd
 import mplfinance as mpf
 
+import os
+from typing import Dict, Any, List, Optional, Literal, Tuple
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from dataclasses import dataclass, field
 from typing import Literal, Optional, List, Tuple, Dict, Set
 
@@ -14,8 +20,10 @@ from swings import find_swings, SwingPoint
 # 1) VERİ ÇEKME
 # ======================
 
-def fetch_ohlc_from_api(symbol: str = "TRXUSDT", interval: str = "15m", limit: int = 500) -> pd.DataFrame:
-    url = "https://fapi.binance.com/fapi/v1/klines"
+BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
+
+def fetch_ohlc_from_api(symbol: str = "BTCUSDT", interval: str = "15m", limit: int = 500) -> pd.DataFrame:
+    url = f"{BASE_URL}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
 
     resp = requests.get(url, params=params, timeout=10)
@@ -71,14 +79,12 @@ class Trade:
 
     base_k: Optional[int] = None
 
-    # band_actions[k] = {"sold","readd"}  -> her bandda max 1 satış+1 geri alım
     band_actions: Dict[int, Set[str]] = field(default_factory=dict)
-
     fills: List[FillEvent] = field(default_factory=list)
 
 
 # ======================
-# 3) FIB ORANLARI (negatif YOK)
+# 3) FIB ORANLARI
 # ======================
 
 UPTREND_FIB_RATIOS = [0.0, 0.5, 1.0, 1.5, 2.5, 3.6, 4.5]
@@ -189,8 +195,6 @@ def generate_trades(
             reason=reason
         ))
 
-    # 0 çizgisi = trend başladığı son pivot (LB2/LH2)
-    # 1 çizgisi = impulse_range kadar ileri
     def init_band(tr: Trade, fib0_price: float, impulse_range: float, fib0_index: int, fib1_index: int):
         if impulse_range == 0:
             return
@@ -205,10 +209,6 @@ def generate_trades(
         tr.base_k = int(np.floor(u))
         tr.band_actions = {}
 
-    # ✅ Yeni kural:
-    # - 0-1 bandda işlem yok
-    # - SADECE 1-2 bandda işlem VAR (pivot_k == 1)
-    # - diğer bandlarda işlem yok
     def handle_band_actions(sp: SwingPoint, signal_idx: int):
         nonlocal current_trade
         tr = current_trade
@@ -224,7 +224,7 @@ def generate_trades(
             return
         pivot_k = int(np.floor(pivot_u))
 
-        # ✅ sadece 1-2 band aktif
+        # sadece 1-2 band aktif
         if pivot_k != 1:
             return
 
@@ -232,25 +232,22 @@ def generate_trades(
             tr.band_actions[pivot_k] = set()
 
         actions = tr.band_actions[pivot_k]
-        px = float(closes[signal_idx])  # ✅ onay barı close
+        px = float(closes[signal_idx])
 
         if tr.direction == "long":
             if sp.kind == "LH" and ("sold" not in actions):
                 tr.fills.append(FillEvent(index=signal_idx, qty_delta=-0.5, price=px, reason="tp50_band"))
                 actions.add("sold")
                 return
-
             if sp.kind == "LB" and ("sold" in actions) and ("readd" not in actions):
                 tr.fills.append(FillEvent(index=signal_idx, qty_delta=+0.5, price=px, reason="readd50_band"))
                 actions.add("readd")
                 return
-
         else:
             if sp.kind == "LB" and ("sold" not in actions):
                 tr.fills.append(FillEvent(index=signal_idx, qty_delta=+0.5, price=px, reason="tp50_band"))
                 actions.add("sold")
                 return
-
             if sp.kind == "LH" and ("sold" in actions) and ("readd" not in actions):
                 tr.fills.append(FillEvent(index=signal_idx, qty_delta=-0.5, price=px, reason="readd50_band"))
                 actions.add("readd")
@@ -426,7 +423,7 @@ def generate_trades(
                         impulse = 0.0
 
                         if lh1 is not None and lb_between is not None:
-                            impulse = float(lb_between.price) - float(lh1.price)  # negatif
+                            impulse = float(lb_between.price) - float(lh1.price)
                             fib0 = float(lh2.price)
                             fib_levels = compute_trend_based_fib_levels(fib0, impulse, DOWNTREND_FIB_RATIOS)
                             fib_start_index = pivot_idx
@@ -477,7 +474,7 @@ def generate_trades(
                         impulse = 0.0
 
                         if lb1 is not None and lh_between is not None:
-                            impulse = float(lh_between.price) - float(lb1.price)  # pozitif
+                            impulse = float(lh_between.price) - float(lb1.price)
                             fib0 = float(lb2.price)
                             fib_levels = compute_trend_based_fib_levels(fib0, impulse, UPTREND_FIB_RATIOS)
                             fib_start_index = pivot_idx
@@ -627,9 +624,9 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
             continue
 
         if tr.direction == "long":
-            long_mask[ei:xi+1] = True
+            long_mask[ei:xi + 1] = True
         else:
-            short_mask[ei:xi+1] = True
+            short_mask[ei:xi + 1] = True
 
     lows = df["Low"].values
     highs = df["High"].values
@@ -707,16 +704,17 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
 # ======================
 
 def main():
-    symbol = "TRXUSDT"
+    symbol = "BTCUSDT"
     interval = "15m"
 
-    df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=200)
+    df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=300)
 
     highs = df["High"].values
     lows = df["Low"].values
 
     right_bars = 1
 
+    # ✅ yeni swing kuralları burada devrede:
     swings = find_swings(
         highs,
         lows,
@@ -724,10 +722,14 @@ def main():
         right_bars=right_bars,
         min_distance=10,
         alt_min_distance=None,
+        min_same_kind_gap=5,  # LH-LH ve LB-LB arası 8
+        min_opposite_gap=2,   # LH-LB arası en az 1 mum arada
+        debug=False
     )
 
     trades = generate_trades(df, swings, stop_buffer_pct=0.0, right_bars=right_bars, max_chase_pct=0.03)
 
+    print("Swing sayısı:", len(swings))
     print("Trade sayısı:", len(trades))
     for t in trades[-10:]:
         print(

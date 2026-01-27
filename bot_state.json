@@ -1,6 +1,15 @@
 {
   "symbol": "BTCUSDT",
   "interval": "15m",
-  "last_processed_bar": "2026-01-27T20:00:00+00:00",
-  "last_processed_fill_key": "587|entry|-1.000000|88287.90"
+  "last_processed_bar": "2026-01-27T23:30:00+00:00",
+  "last_processed_fill_key": "595|entry|-1.000000|88173.00",
+  "first_run": false,
+  "startup_reference_direction": "short",
+  "startup_blocked_until_flip": true,
+  "armed": true,
+  "last_trade_direction": "short",
+  "last_status_print": null,
+  "startup_wait_mode": null,
+  "startup_observed_trend": null,
+  "startup_unlocked": true
 }
