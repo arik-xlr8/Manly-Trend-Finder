@@ -1,17 +1,15 @@
 # plot_swings_from_api.py
+import os
 import requests
 import numpy as np
 import pandas as pd
 import mplfinance as mpf
 
-import os
-from typing import Dict, Any, List, Optional, Literal, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Literal, Tuple, Set
 
 from dotenv import load_dotenv
 load_dotenv()
-
-from dataclasses import dataclass, field
-from typing import Literal, Optional, List, Tuple, Dict, Set
 
 from swings import find_swings, SwingPoint
 
@@ -20,7 +18,8 @@ from swings import find_swings, SwingPoint
 # 1) VERİ ÇEKME
 # ======================
 
-BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
+BASE_URL = os.getenv("", "https://fapi.binance.com").rstrip("/")
+
 
 def fetch_ohlc_from_api(symbol: str = "BTCUSDT", interval: str = "15m", limit: int = 500) -> pd.DataFrame:
     url = f"{BASE_URL}/fapi/v1/klines"
@@ -39,12 +38,13 @@ def fetch_ohlc_from_api(symbol: str = "BTCUSDT", interval: str = "15m", limit: i
     df = pd.DataFrame(data, columns=cols)
     df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
 
-    df["Date"] = pd.to_datetime(df["open_time"], unit="ms")
+    # Bot ile tutarlı: UTC index + sort
+    df["Date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df.set_index("Date", inplace=True)
 
     df = df[["open", "high", "low", "close", "volume"]]
     df.columns = ["Open", "High", "Low", "Close", "Volume"]
-    return df
+    return df.sort_index()
 
 
 # ======================
@@ -54,9 +54,9 @@ def fetch_ohlc_from_api(symbol: str = "BTCUSDT", interval: str = "15m", limit: i
 @dataclass
 class FillEvent:
     index: int
-    qty_delta: float     # + artır / - azalt ; 0 => flatten
-    price: float         # onay barının Close'u
-    reason: str          # "entry", "tp50_band", "readd50_band", "exit", "stop"
+    qty_delta: float
+    price: float
+    reason: str  # "entry", "tp50_band", "readd50_band", "exit", "stop"
 
 
 @dataclass
@@ -78,7 +78,6 @@ class Trade:
     fib1_index: Optional[int] = None
 
     base_k: Optional[int] = None
-
     band_actions: Dict[int, Set[str]] = field(default_factory=dict)
     fills: List[FillEvent] = field(default_factory=list)
 
@@ -580,7 +579,6 @@ def generate_trades(
                         )
                     reset_trailing_state()
 
-        # D) pivot update
         last_signal = sp
         if sp.kind == "LB":
             last_lb = sp
@@ -704,27 +702,34 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
 # ======================
 
 def main():
-    symbol = "BTCUSDT"
-    interval = "15m"
+    symbol = os.getenv("BOT_SYMBOL", "BTCUSDT")
+    interval = os.getenv("BOT_INTERVAL", "15m")
+    limit = int(os.getenv("BOT_LOOKBACK_LIMIT", "300"))
 
-    df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=300)
+    left_bars = int(os.getenv("BOT_LEFT_BARS", "5"))
+    right_bars = int(os.getenv("BOT_RIGHT_BARS", "1"))
+
+    # “8’den 5’e düşürme” isteğine uygun: default 5
+    min_same_kind_gap = int(os.getenv("BOT_MIN_SAME_KIND_GAP", "8"))
+    min_opposite_gap = int(os.getenv("BOT_MIN_OPPOSITE_GAP", "4"))
+
+    swing_debug = os.getenv("SWING_DEBUG", "false").lower() in ("1", "true", "yes", "y", "on")
+
+    df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=limit)
 
     highs = df["High"].values
     lows = df["Low"].values
 
-    right_bars = 1
-
-    # ✅ yeni swing kuralları burada devrede:
     swings = find_swings(
         highs,
         lows,
-        left_bars=5,
+        left_bars=left_bars,
         right_bars=right_bars,
-        min_distance=10,
+        min_distance=None,
         alt_min_distance=None,
-        min_same_kind_gap=5,  # LH-LH ve LB-LB arası 8
-        min_opposite_gap=2,   # LH-LB arası en az 1 mum arada
-        debug=False
+        min_same_kind_gap=min_same_kind_gap,
+        min_opposite_gap=min_opposite_gap,
+        debug=swing_debug
     )
 
     trades = generate_trades(df, swings, stop_buffer_pct=0.0, right_bars=right_bars, max_chase_pct=0.03)

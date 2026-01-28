@@ -1,3 +1,4 @@
+# bot.py
 from __future__ import annotations
 
 import os
@@ -25,15 +26,15 @@ from plot_swings_from_api import generate_trades
 
 SYMBOL = os.getenv("BOT_SYMBOL", "BTCUSDT")
 INTERVAL = os.getenv("BOT_INTERVAL", "15m")
-LOOKBACK_LIMIT = int(os.getenv("BOT_LOOKBACK_LIMIT", "600"))
+LOOKBACK_LIMIT = int(os.getenv("BOT_LOOKBACK_LIMIT", "192"))
 
 LEFT_BARS = int(os.getenv("BOT_LEFT_BARS", "5"))
 RIGHT_BARS = int(os.getenv("BOT_RIGHT_BARS", "1"))
 MIN_DISTANCE = int(os.getenv("BOT_MIN_DISTANCE", "10"))
 
 # ✅ Yeni swing filtre parametreleri (son hal)
-MIN_SAME_KIND_GAP = int(os.getenv("BOT_MIN_SAME_KIND_GAP", "5"))     # LH->LH ve LB->LB
-MIN_OPPOSITE_GAP = int(os.getenv("BOT_MIN_OPPOSITE_GAP", "2"))       # LH<->LB arası (en az 1 mum ara = 2)
+MIN_SAME_KIND_GAP = int(os.getenv("BOT_MIN_SAME_KIND_GAP", "7"))  # LH->LH ve LB->LB
+MIN_OPPOSITE_GAP = int(os.getenv("BOT_MIN_OPPOSITE_GAP", "3"))    # LH<->LB arası 3
 SWING_DEBUG = os.getenv("BOT_SWING_DEBUG", "false").lower() in ("1", "true", "yes", "y", "on")
 
 MAX_CHASE_PCT = float(os.getenv("BOT_MAX_CHASE_PCT", "0.03"))
@@ -94,6 +95,10 @@ def _safety_checks_or_die() -> None:
             "Testnet için: BINANCE_FUTURES_BASE_URL=https://testnet.binancefuture.com"
         )
 
+    # Binance limit guard (tek request max 1500)
+    if LOOKBACK_LIMIT <= 0 or LOOKBACK_LIMIT > 1500:
+        raise RuntimeError("BOT_LOOKBACK_LIMIT 1..1500 aralığında olmalı (Binance tek istekte max=1500).")
+
 
 def _sign(params: Dict[str, Any]) -> str:
     q = urllib.parse.urlencode(params, doseq=True)
@@ -132,12 +137,15 @@ def load_state() -> Dict[str, Any]:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             st = json.load(f)
+
         st.setdefault("last_processed_bar", None)
         st.setdefault("last_processed_fill_key", None)
+
         st.setdefault("first_run", True)
         st.setdefault("startup_wait_mode", None)
         st.setdefault("startup_observed_trend", None)
         st.setdefault("startup_unlocked", False)
+
         st.setdefault("armed", False)
         st.setdefault("last_trade_direction", None)
         return st
@@ -301,6 +309,7 @@ def fill_key(ev: Any) -> str:
 
 
 def _compute_swings(df: pd.DataFrame):
+    # Not: min_distance/alt_min_distance imzada duruyor (kullanmıyoruz)
     return find_swings(
         df["High"].values,
         df["Low"].values,
@@ -384,13 +393,14 @@ def decide_and_execute(df: pd.DataFrame, st: Dict[str, Any]) -> None:
 
     if not trades:
         current_trend: TrendLabel = "trend_yok"
-        fills = []
+        fills: List[Any] = []
     else:
         last_trade = trades[-1]
         d = getattr(last_trade, "direction", None)
         current_trend = d if d in ("long", "short") else "belirsiz"  # type: ignore
         fills = list(getattr(last_trade, "fills", None) or [])
 
+    # İlk run state kaydı (safety)
     if st.get("first_run", False):
         st["startup_observed_trend"] = current_trend
         st["startup_wait_mode"] = desired_wait_mode(current_trend)
@@ -401,6 +411,7 @@ def decide_and_execute(df: pd.DataFrame, st: Dict[str, Any]) -> None:
         save_state(st)
         return
 
+    # Unlock kontrolü
     if not st.get("startup_unlocked", False):
         wm: WaitMode = st.get("startup_wait_mode") or "accept_any"
         if is_unlocked_by_trend(wm, current_trend):
@@ -413,6 +424,7 @@ def decide_and_execute(df: pd.DataFrame, st: Dict[str, Any]) -> None:
             save_state(st)
             return
 
+    # Trend değiştiyse armed
     prev_dir = st.get("last_trade_direction")
     if prev_dir is not None and current_trend in ("long", "short") and prev_dir in ("long", "short"):
         if current_trend != prev_dir:
@@ -458,7 +470,7 @@ def decide_and_execute(df: pd.DataFrame, st: Dict[str, Any]) -> None:
             if not st.get("armed", False):
                 print("  -> entry blocked (armed=False; trend change bekleniyor)")
                 continue
-            if is_flat is False:
+            if not is_flat:
                 print("  -> skip entry (position already open)")
                 continue
             if current_trend not in ("long", "short"):
@@ -514,6 +526,7 @@ def main():
 
     print(f"\n[INFO] Bot dinlemede: {SYMBOL} / {INTERVAL} | poll={POLL_SECONDS}s | source={BASE_URL}")
 
+    # STARTUP bilgi
     try:
         df0 = fetch_ohlc()
         last_bar_iso = df0.index[-1].isoformat()
@@ -532,6 +545,7 @@ def main():
         print(f"[STARTUP] swings={swc0} trades={trc0} | mevcut durum: {format_trend_label(trend0)}")
         print(f"[STARTUP] strateji: {format_wait_mode(wait_mode0)}")
 
+        # İlk kez koşuyorsa state’e yaz
         if st.get("first_run", True):
             st["startup_observed_trend"] = trend0
             st["startup_wait_mode"] = wait_mode0
@@ -541,6 +555,7 @@ def main():
             st["first_run"] = False
             save_state(st)
 
+        # spam azaltma: ilk bar kaydı
         if st.get("last_processed_bar") is None:
             st["last_processed_bar"] = last_bar_iso
             save_state(st)
