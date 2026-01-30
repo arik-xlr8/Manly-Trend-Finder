@@ -24,29 +24,34 @@ def find_swings(
     min_distance: Optional[int] = None,
     alt_min_distance: Optional[int] = None,
 
-    # ✅ SENİN İSTEDİĞİN KURALLAR
-    min_same_kind_gap: int = 20,  # LH->LH ve LB->LB arası min mum
-    min_opposite_gap: int = 5,    # LH<->LB arası min fark
+    # kurallar
+    min_same_kind_gap: int = 10,  # LH->LH ve LB->LB arası min mum (repaint modunda "kabul" değil, "replace penceresi" gibi düşün)
+    min_opposite_gap: int = 4,    # LH<->LB arası min fark
 
     debug: bool = False,
 
-    # ✅ repaint fix
+    # repaint fix (canlıda kapanmamış bar)
     ignore_last_bar: bool = True,
 ) -> List[SwingPoint]:
     """
-    Swing üretim kuralları:
-    1) Pivot high/low adayları çıkarılır (left/right penceresi ile).
-    2) Aynı index'te hem LH hem LB varsa tekine düşür (alternation/prominence).
-    3) Gap filtreleri uygulanır:
-        - opposite gap: min_opposite_gap
-        - same-kind gap: min_same_kind_gap
-    4) ✅ KİLİT: Bir pivot seçildiyse ASLA override/replace edilmez.
-       (Daha iyi tepe/dip gelse bile eski pivot kıpırdamaz; yeni aday drop edilir.)
-    5) ÇIKTI doğal olarak "1 tepe 1 dip" alternasyonuna gider; aynı tip gelirse drop edilir.
+    ✅ REPAINT (ZIGZAG) mantığı:
 
-    Repaint notu:
-    - right_bars > 0 ise pivot "confirmed" için sağda right_bars kadar kapanmış bar gerekir.
-    - ignore_last_bar=True: canlıda kapanmamış son bar sağ pencereye girip pivotları oynatmasın.
+    1) left/right penceresiyle "confirmed" pivot adayları çıkarılır.
+    2) Aynı index'te hem LH hem LB varsa tekine düşür (alternation/prominence).
+    3) Pivotları soldan sağa yürürken:
+       - Eğer yeni pivot, son pivotla AYNI TİP ise (LH->LH / LB->LB):
+            -> daha ekstrem ise (LH daha yüksek / LB daha düşük) SON PIVOTU REPLACE eder
+            -> değilse drop eder
+          (Bu, "repaint" davranışıdır: son tepe/dip daha iyi bir ekstremle güncellenir.)
+       - Eğer yeni pivot TERS TİP ise (LH<->LB):
+            -> gap < min_opposite_gap ise gürültü sayıp drop eder
+            -> değilse ekler
+    4) min_same_kind_gap:
+       - repaint modunda aynı tipin "eklenmesi" zaten yok; sadece replace var.
+       - yine de istersen, çok yakın aynı-tip replace'leri engellemek için "replace penceresi" gibi uygulanır:
+            -> aynı tip geldiğinde gap < min_same_kind_gap ise replace'e izin ver
+            -> gap >= min_same_kind_gap ise (zaten aynı tip üst üste geldiği için) yine replace mantığı çalışır.
+         (Yani bu parametre repaintte “accept” değil, “ne kadar hızlı güncelleyeyim” gibi davranır.)
     """
 
     h_arr = np.asarray(highs, dtype=float)
@@ -61,14 +66,13 @@ def find_swings(
     if effective_n <= 0:
         return []
 
-    # Pivot aday aralığı:
-    # i in [left_bars, effective_n - right_bars)
+    # Pivot aday aralığı: i in [left_bars, effective_n - right_bars)
     last_i_exclusive = effective_n - right_bars
     if last_i_exclusive <= left_bars:
         return []
 
     # -----------------------------
-    # 1) HAM PIVOTLAR
+    # 1) HAM (CONFIRMED) PIVOTLAR
     # -----------------------------
     raw: List[SwingPoint] = []
     last_kind: Optional[str] = None  # aynı mumda çift pivot olursa alternation için
@@ -96,7 +100,7 @@ def find_swings(
             elif last_kind == "LB":
                 chosen_kind = "LH"
             else:
-                # prominence hesabı (mevcut mantık)
+                # prominence (mevcut mantık)
                 if len(left_h) > 0 or len(right_h) > 0:
                     neigh_h_max = float(np.max(np.concatenate([left_h, right_h])))
                 else:
@@ -131,13 +135,21 @@ def find_swings(
         return []
 
     # -----------------------------
-    # 2) GAP + ALTERNATION (✅ NO REPLACE, SADECE DROP)
+    # 2) REPAINT ZIGZAG FİLTRE
     # -----------------------------
     out: List[SwingPoint] = []
 
     drop_opp = 0
     drop_same = 0
-    drop_alt_samekind = 0
+    repl_same = 0
+
+    def is_more_extreme(new_sp: SwingPoint, old_sp: SwingPoint) -> bool:
+        if new_sp.kind != old_sp.kind:
+            return False
+        if new_sp.kind == "LH":
+            return new_sp.price > old_sp.price
+        else:
+            return new_sp.price < old_sp.price
 
     for sp in raw:
         if not out:
@@ -147,54 +159,35 @@ def find_swings(
         prev = out[-1]
         gap = sp.index - prev.index
 
-        # Same-kind (LH->LH veya LB->LB): asla replace yok, sadece şart sağlanıyorsa bile
-        # "1 tepe 1 dip" istediğin için aynı tip gelince direkt drop.
+        # Aynı tip geldiyse: REPAINT = daha ekstremse REPLACE
         if sp.kind == prev.kind:
-            # aynı tip gelmiş; sen "override istemiyorum" dediğin için replace yok.
-            # ayrıca min_same_kind_gap kuralı da var ama zaten aynı tip gelince drop ediyoruz.
-            drop_alt_samekind += 1
-            if debug:
-                print(f"[DROP alt_samekind] {sp.kind} i={sp.index} (prev={prev.kind}@{prev.index})")
+            # Çok yakınsa da (min_same_kind_gap), repaint mantığında bu zaten replace penceresi gibi iş görüyor
+            if is_more_extreme(sp, prev):
+                out[-1] = sp
+                repl_same += 1
+                if debug:
+                    print(f"[REPLACE samekind] {sp.kind} prev@{prev.index}:{prev.price} -> new@{sp.index}:{sp.price}")
+            else:
+                drop_same += 1
+                if debug:
+                    print(f"[DROP samekind] {sp.kind} new@{sp.index}:{sp.price} (prev@{prev.index}:{prev.price})")
             continue
 
-        # Opposite gap (LB<->LH)
+        # Ters tip geldiyse: min_opposite_gap şartı
         if gap < min_opposite_gap:
             drop_opp += 1
             if debug:
                 print(f"[DROP opp_gap] {sp.kind} i={sp.index} (prev={prev.kind}@{prev.index}) need>={min_opposite_gap}")
             continue
 
-        # Ek güvenlik: “iki pivot arası” dediğin için burada aynı zamanda
-        # önceki pivot ile yeni pivot farklı olsa bile genel minimumu sağlıyor zaten.
-
         out.append(sp)
-
-    # -----------------------------
-    # 3) (Opsiyonel) Aynı tip arası 20 mum kuralı:
-    # Zaten alternation ile aynı tip yan yana gelmiyor.
-    # Ama teorik olarak "LB ... LH ... LB" içinde LB-LB mesafesini de kontrol etmek istersen:
-    # burada ikinci bir pass ile aynı tip son görülen indexe bakıp drop edebiliriz.
-    # Sen bunu net istediğin için ekledim.
-    # -----------------------------
-    final: List[SwingPoint] = []
-    last_seen_same: dict[str, int] = {"LH": -10**18, "LB": -10**18}
-
-    for sp in out:
-        last_i = last_seen_same.get(sp.kind, -10**18)
-        if (sp.index - last_i) < min_same_kind_gap:
-            drop_same += 1
-            if debug:
-                print(f"[DROP same_kind_gap] {sp.kind} i={sp.index} last_same={last_i} need>={min_same_kind_gap}")
-            continue
-        final.append(sp)
-        last_seen_same[sp.kind] = sp.index
 
     if debug:
         print(
-            f"[SWINGS] raw={len(raw)} out={len(out)} final={len(final)} | "
-            f"drop_opp={drop_opp} drop_alt_samekind={drop_alt_samekind} drop_same_kind_gap={drop_same} "
+            f"[SWINGS-REPAINT] raw={len(raw)} out={len(out)} | "
+            f"replace_same={repl_same} drop_same={drop_same} drop_opp={drop_opp} "
             f"(ignore_last_bar={ignore_last_bar}, right_bars={right_bars}, "
             f"min_opposite_gap={min_opposite_gap}, min_same_kind_gap={min_same_kind_gap})"
         )
 
-    return final
+    return out
