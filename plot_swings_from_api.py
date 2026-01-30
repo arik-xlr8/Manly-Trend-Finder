@@ -14,8 +14,8 @@ from typing import Literal, Optional, List
 # ======================
 
 def fetch_ohlc_from_api(
-    symbol: str = "ETHUSDT",
-    interval: str = "15m",
+    symbol: str = "TURBOUSDT",
+    interval: str = "3m",
     limit: int = 500,
 ) -> pd.DataFrame:
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -510,8 +510,8 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
 # ======================
 
 def main():
-    symbol = "ETHUSDT"
-    interval = "15m"
+    symbol = "TURBOUSDT"
+    interval = "3m"
 
     df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=100)
 
