@@ -1,15 +1,22 @@
 {
-  "symbol": "BTCUSDT",
-  "interval": "15m",
-  "last_processed_bar": "2026-01-28T00:15:00+00:00",
-  "last_processed_fill_key": "595|entry|-1.000000|88173.00",
-  "first_run": false,
-  "startup_reference_direction": "short",
-  "startup_blocked_until_flip": true,
-  "armed": true,
-  "last_trade_direction": "short",
-  "last_status_print": null,
-  "startup_wait_mode": null,
-  "startup_observed_trend": null,
-  "startup_unlocked": true
+  "last_closed_bar_time": "2026-01-30T15:45:00+00:00",
+  "base_qty": 2974212.0,
+  "active_stop_client_id": "MANLYBOT-STOP-1769784304",
+  "last_stop_price": 0.0013478,
+  "stop_side": "SELL",
+  "last_tp50_fill_bar": null,
+  "has_entered_once": true,
+  "startup_printed": true,
+  "prev_pos_amt": 2974212.0,
+  "uncertain_active": false,
+  "last_entry_context": "trend",
+  "uncertain_last_pivot_idx": null,
+  "uncertain_last_pivot_kind": null,
+  "uncertain_last_pivot_price": null,
+  "band_state": {
+    "tp50_done": {},
+    "readd_done": {},
+    "tp50_pivot_idx": {},
+    "entry_pivot_idx": 296
+  }
 }

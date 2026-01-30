@@ -1,5 +1,6 @@
 # plot_swings_from_api.py
 import os
+import time
 import requests
 import numpy as np
 import pandas as pd
@@ -18,7 +19,7 @@ from swings import find_swings, SwingPoint
 # 1) VERİ ÇEKME
 # ======================
 
-BASE_URL = os.getenv("", "https://fapi.binance.com").rstrip("/")
+BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
 
 
 def fetch_ohlc_from_api(symbol: str = "BTCUSDT", interval: str = "15m", limit: int = 500) -> pd.DataFrame:
@@ -37,14 +38,23 @@ def fetch_ohlc_from_api(symbol: str = "BTCUSDT", interval: str = "15m", limit: i
 
     df = pd.DataFrame(data, columns=cols)
     df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+    df[["open_time", "close_time"]] = df[["open_time", "close_time"]].astype(np.int64)
 
     # Bot ile tutarlı: UTC index + sort
     df["Date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df.set_index("Date", inplace=True)
+    df = df.sort_index()
+
+    # ✅ Bot sadece kapanan mum ile çalışır → kapanmamış son mumu at
+    now_ms = int(time.time() * 1000)
+    if len(df) > 0:
+        last_close_time = int(df["close_time"].iloc[-1])
+        if now_ms < last_close_time:
+            df = df.iloc[:-1]
 
     df = df[["open", "high", "low", "close", "volume"]]
     df.columns = ["Open", "High", "Low", "Close", "Volume"]
-    return df.sort_index()
+    return df
 
 
 # ======================
@@ -56,7 +66,39 @@ class FillEvent:
     index: int
     qty_delta: float
     price: float
-    reason: str  # "entry", "tp50_band", "readd50_band", "exit", "stop"
+    reason: str  # "entry", "tp50 band=<k>", "readd band=<k>", "exit", "stop"
+
+
+def _safe_rnd(x: Optional[float], nd: int = 12) -> float:
+    if x is None:
+        return 0.0
+    try:
+        return float(np.round(float(x), nd))
+    except Exception:
+        return 0.0
+
+
+def _make_trade_key(
+    direction: str,
+    entry_index: int,
+    entry_price: float,
+    fib0_price: Optional[float],
+    fib1_price: Optional[float],
+    fib0_index: Optional[int],
+    fib1_index: Optional[int],
+    fib_start_index: Optional[int],
+) -> str:
+    # Bot tarafında TP50 spam’ini engellemek için "trade-bazlı" stabil anahtar.
+    return (
+        f"{direction}|"
+        f"ei={int(entry_index)}|"
+        f"ep={_safe_rnd(entry_price)}|"
+        f"f0={_safe_rnd(fib0_price)}|"
+        f"f1={_safe_rnd(fib1_price)}|"
+        f"f0i={int(fib0_index) if fib0_index is not None else -1}|"
+        f"f1i={int(fib1_index) if fib1_index is not None else -1}|"
+        f"fsi={int(fib_start_index) if fib_start_index is not None else -1}"
+    )
 
 
 @dataclass
@@ -80,6 +122,21 @@ class Trade:
     base_k: Optional[int] = None
     band_actions: Dict[int, Set[str]] = field(default_factory=dict)
     fills: List[FillEvent] = field(default_factory=list)
+
+    # bot’un trade-bazlı kilitlemesi için
+    trade_key: str = ""
+
+    def refresh_trade_key(self) -> None:
+        self.trade_key = _make_trade_key(
+            direction=self.direction,
+            entry_index=self.entry_index,
+            entry_price=self.entry_price,
+            fib0_price=self.fib0_price,
+            fib1_price=self.fib1_price,
+            fib0_index=self.fib0_index,
+            fib1_index=self.fib1_index,
+            fib_start_index=self.fib_start_index,
+        )
 
 
 # ======================
@@ -105,6 +162,10 @@ def _fib_u(price: float, fib0: float, fib1: float) -> Optional[float]:
     if den == 0:
         return None
     return (price - fib0) / den
+
+
+# Bot.py ile aynı kural: 0 ve 1 bandı yasak
+BANNED_BANDS = {0, 1}
 
 
 # ======================
@@ -154,7 +215,13 @@ def generate_trades(
         return float(tr.stop_level)
 
     def pivot_stop_level(pivot_idx: int, kind: str) -> float:
-        return float(df["Low"].iloc[pivot_idx]) if kind == "LB" else float(df["High"].iloc[pivot_idx])
+        base = float(df["Low"].iloc[pivot_idx]) if kind == "LB" else float(df["High"].iloc[pivot_idx])
+        if stop_buffer_pct and stop_buffer_pct != 0.0:
+            if kind == "LB":
+                return base * (1.0 - abs(stop_buffer_pct))
+            else:
+                return base * (1.0 + abs(stop_buffer_pct))
+        return base
 
     def chase_too_much(direction: str, pivot_idx: int, signal_idx: int) -> bool:
         if pivot_idx < 0 or pivot_idx >= n or signal_idx < 0 or signal_idx >= n:
@@ -186,10 +253,16 @@ def generate_trades(
             reason="entry"
         ))
 
+    def _current_pos(tr: Trade) -> float:
+        return float(sum(f.qty_delta for f in tr.fills))
+
     def add_flatten_fill(tr: Trade, idx: int, reason: str):
+        pos = _current_pos(tr)
+        if abs(pos) < 1e-12:
+            return
         tr.fills.append(FillEvent(
             index=idx,
-            qty_delta=0.0,
+            qty_delta=-pos,  # pozisyonu 0'a getir
             price=float(closes[idx]) if 0 <= idx < n else float(tr.entry_price),
             reason=reason
         ))
@@ -208,7 +281,17 @@ def generate_trades(
         tr.base_k = int(np.floor(u))
         tr.band_actions = {}
 
+        tr.refresh_trade_key()
+
     def handle_band_actions(sp: SwingPoint, signal_idx: int):
+        """
+        BOT UYUMLU:
+        - reason: "tp50 band=<k>" / "readd band=<k>"
+        - per-band sold/readd (trade içi)
+        - banned bands: 0,1
+        - long: LH -> tp50, sonra LB -> readd
+        - short: LB -> tp50, sonra LH -> readd
+        """
         nonlocal current_trade
         tr = current_trade
         if tr is None:
@@ -223,8 +306,7 @@ def generate_trades(
             return
         pivot_k = int(np.floor(pivot_u))
 
-        # sadece 1-2 band aktif
-        if pivot_k != 1:
+        if pivot_k in BANNED_BANDS:
             return
 
         if pivot_k not in tr.band_actions:
@@ -233,24 +315,67 @@ def generate_trades(
         actions = tr.band_actions[pivot_k]
         px = float(closes[signal_idx])
 
+        # LONG
         if tr.direction == "long":
+            # TP50: TOP pivot (LH) => sell 0.5
             if sp.kind == "LH" and ("sold" not in actions):
-                tr.fills.append(FillEvent(index=signal_idx, qty_delta=-0.5, price=px, reason="tp50_band"))
+                tr.fills.append(FillEvent(
+                    index=signal_idx,
+                    qty_delta=-0.5,
+                    price=px,
+                    reason=f"tp50 band={pivot_k}"
+                ))
                 actions.add("sold")
                 return
+
+            # READD: BOTTOM pivot (LB) after sold => buy 0.5
             if sp.kind == "LB" and ("sold" in actions) and ("readd" not in actions):
-                tr.fills.append(FillEvent(index=signal_idx, qty_delta=+0.5, price=px, reason="readd50_band"))
+                tr.fills.append(FillEvent(
+                    index=signal_idx,
+                    qty_delta=+0.5,
+                    price=px,
+                    reason=f"readd band={pivot_k}"
+                ))
                 actions.add("readd")
                 return
+
+        # SHORT
         else:
+            # TP50: BOTTOM pivot (LB) => buy 0.5 (short azaltma)
             if sp.kind == "LB" and ("sold" not in actions):
-                tr.fills.append(FillEvent(index=signal_idx, qty_delta=+0.5, price=px, reason="tp50_band"))
+                tr.fills.append(FillEvent(
+                    index=signal_idx,
+                    qty_delta=+0.5,
+                    price=px,
+                    reason=f"tp50 band={pivot_k}"
+                ))
                 actions.add("sold")
                 return
+
+            # READD: TOP pivot (LH) after sold => sell 0.5 (short artırma)
             if sp.kind == "LH" and ("sold" in actions) and ("readd" not in actions):
-                tr.fills.append(FillEvent(index=signal_idx, qty_delta=-0.5, price=px, reason="readd50_band"))
+                tr.fills.append(FillEvent(
+                    index=signal_idx,
+                    qty_delta=-0.5,
+                    price=px,
+                    reason=f"readd band={pivot_k}"
+                ))
                 actions.add("readd")
                 return
+
+    def _new_trade(direction: Literal["long", "short"], entry_idx: int, stop_level: float,
+                   fib_levels=None, fib_start_index=None) -> Trade:
+        tr = Trade(
+            direction=direction,
+            entry_index=int(entry_idx),
+            entry_price=float(closes[entry_idx]),
+            stop_level=float(stop_level),
+            fib_levels=fib_levels,
+            fib_start_index=fib_start_index
+        )
+        add_entry_fill(tr)
+        tr.refresh_trade_key()
+        return tr
 
     def open_uncertain_trade_by_signal(signal: SwingPoint, entry_idx: int):
         nonlocal current_trade
@@ -259,20 +384,12 @@ def generate_trades(
 
         if signal.kind == "LH":
             direction: Literal["long", "short"] = "short"
-            stop_level = float(df["High"].iloc[signal.index])
+            stop_level = pivot_stop_level(signal.index, "LH")
         else:
             direction = "long"
-            stop_level = float(df["Low"].iloc[signal.index])
+            stop_level = pivot_stop_level(signal.index, "LB")
 
-        current_trade = Trade(
-            direction=direction,
-            entry_index=entry_idx,
-            entry_price=float(closes[entry_idx]),
-            stop_level=stop_level,
-            fib_levels=None,
-            fib_start_index=None
-        )
-        add_entry_fill(current_trade)
+        current_trade = _new_trade(direction, entry_idx, stop_level, fib_levels=None, fib_start_index=None)
         reset_trailing_state()
 
     def try_uncertain_entry_after_stop(now_idx: int):
@@ -291,7 +408,9 @@ def generate_trades(
         prev_lb = last_lb
         prev_lh = last_lh
 
-        # A) STOP taraması
+        # =========================
+        # A) STOP taraması (öncelik)
+        # =========================
         if current_trade is not None:
             start_i = max(current_trade.entry_index, last_checked_bar + 1)
             end_i = signal_idx
@@ -314,7 +433,9 @@ def generate_trades(
 
         last_checked_bar = max(last_checked_bar, signal_idx)
 
+        # =========================
         # B) BELİRSİZ MOD
+        # =========================
         if mode == "uncertain":
             uptrend_confirm = (sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price)
             downtrend_confirm = (sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price)
@@ -338,15 +459,7 @@ def generate_trades(
 
                     if current_trade is None:
                         stop_level = pivot_stop_level(pivot_idx, "LB" if desired == "long" else "LH")
-                        current_trade = Trade(
-                            direction=desired,
-                            entry_index=signal_idx,
-                            entry_price=float(closes[signal_idx]),
-                            stop_level=stop_level,
-                            fib_levels=None,
-                            fib_start_index=None
-                        )
-                        add_entry_fill(current_trade)
+                        current_trade = _new_trade(desired, signal_idx, stop_level, fib_levels=None, fib_start_index=None)
                         reset_trailing_state()
 
                 last_signal = sp
@@ -356,11 +469,13 @@ def generate_trades(
                     last_lh = sp
                 continue
 
+        # =========================
         # C) NORMAL MOD
+        # =========================
         if current_trade is not None:
             handle_band_actions(sp, signal_idx)
 
-        # Trailing stop (eski mantık)
+        # Trailing stop (pivotlara göre)
         if current_trade is not None:
             if current_trade.direction == "long":
                 if sp.kind == "LH":
@@ -371,6 +486,8 @@ def generate_trades(
                         if sp.price > long_last_high.price and long_candidate_low is not None:
                             if long_candidate_low.index > long_last_high.index:
                                 new_stop = float(df["Low"].iloc[long_candidate_low.index])
+                                if stop_buffer_pct and stop_buffer_pct != 0.0:
+                                    new_stop = new_stop * (1.0 - abs(stop_buffer_pct))
                                 if new_stop > current_trade.stop_level:
                                     current_trade.stop_level = new_stop
                                 long_last_high = sp
@@ -387,6 +504,8 @@ def generate_trades(
                         if sp.price < short_last_low.price and short_candidate_high is not None:
                             if short_candidate_high.index > short_last_low.index:
                                 new_stop = float(df["High"].iloc[short_candidate_high.index])
+                                if stop_buffer_pct and stop_buffer_pct != 0.0:
+                                    new_stop = new_stop * (1.0 + abs(stop_buffer_pct))
                                 if new_stop < current_trade.stop_level:
                                     current_trade.stop_level = new_stop
                                 short_last_low = sp
@@ -432,11 +551,12 @@ def generate_trades(
                             direction="short",
                             entry_index=signal_idx,
                             entry_price=entry_price,
-                            stop_level=stop_level,
+                            stop_level=float(stop_level),
                             fib_levels=fib_levels,
                             fib_start_index=fib_start_index
                         )
                         add_entry_fill(current_trade)
+                        current_trade.refresh_trade_key()
 
                         if lh1 is not None and lb_between is not None:
                             init_band(
@@ -483,11 +603,12 @@ def generate_trades(
                             direction="long",
                             entry_index=signal_idx,
                             entry_price=entry_price,
-                            stop_level=stop_level,
+                            stop_level=float(stop_level),
                             fib_levels=fib_levels,
                             fib_start_index=fib_start_index
                         )
                         add_entry_fill(current_trade)
+                        current_trade.refresh_trade_key()
 
                         if lb1 is not None and lh_between is not None:
                             init_band(
@@ -524,11 +645,12 @@ def generate_trades(
                         direction="long",
                         entry_index=signal_idx,
                         entry_price=entry_price,
-                        stop_level=stop_level,
+                        stop_level=float(stop_level),
                         fib_levels=fib_levels,
                         fib_start_index=fib_start_index
                     )
                     add_entry_fill(current_trade)
+                    current_trade.refresh_trade_key()
 
                     if lb1 is not None and lh_between is not None:
                         init_band(
@@ -563,11 +685,12 @@ def generate_trades(
                         direction="short",
                         entry_index=signal_idx,
                         entry_price=entry_price,
-                        stop_level=stop_level,
+                        stop_level=float(stop_level),
                         fib_levels=fib_levels,
                         fib_start_index=fib_start_index
                     )
                     add_entry_fill(current_trade)
+                    current_trade.refresh_trade_key()
 
                     if lh1 is not None and lb_between is not None:
                         init_band(
@@ -704,16 +827,16 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
 def main():
     symbol = os.getenv("BOT_SYMBOL", "BTCUSDT")
     interval = os.getenv("BOT_INTERVAL", "15m")
-    limit = int(os.getenv("BOT_LOOKBACK_LIMIT", "300"))
+    limit = int(os.getenv("BOT_LOOKBACK_LIMIT", "600"))
 
     left_bars = int(os.getenv("BOT_LEFT_BARS", "5"))
     right_bars = int(os.getenv("BOT_RIGHT_BARS", "1"))
 
-    # “8’den 5’e düşürme” isteğine uygun: default 5
-    min_same_kind_gap = int(os.getenv("BOT_MIN_SAME_KIND_GAP", "8"))
-    min_opposite_gap = int(os.getenv("BOT_MIN_OPPOSITE_GAP", "4"))
+    min_same_kind_gap = int(os.getenv("BOT_MIN_SAME_KIND_GAP", "5"))
+    min_opposite_gap = int(os.getenv("BOT_MIN_OPPOSITE_GAP", "2"))
 
-    swing_debug = os.getenv("SWING_DEBUG", "false").lower() in ("1", "true", "yes", "y", "on")
+    swing_debug = os.getenv("BOT_SWING_DEBUG", "false").lower() in ("1", "true", "yes", "y", "on")
+    max_chase_pct = float(os.getenv("BOT_MAX_CHASE_PCT", "0.03"))
 
     df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=limit)
 
@@ -729,19 +852,27 @@ def main():
         alt_min_distance=None,
         min_same_kind_gap=min_same_kind_gap,
         min_opposite_gap=min_opposite_gap,
-        debug=swing_debug
+        debug=swing_debug,
+        ignore_last_bar=True,
     )
 
-    trades = generate_trades(df, swings, stop_buffer_pct=0.0, right_bars=right_bars, max_chase_pct=0.03)
+    trades = generate_trades(
+        df,
+        swings,
+        stop_buffer_pct=float(os.getenv("BOT_STOP_BUFFER_PCT", "0.0")),
+        right_bars=right_bars,
+        max_chase_pct=max_chase_pct,
+    )
 
     print("Swing sayısı:", len(swings))
     print("Trade sayısı:", len(trades))
     for t in trades[-10:]:
         print(
             t.direction,
+            "key:", t.trade_key,
             "entry:", t.entry_index,
             "exit:", t.exit_index,
-            "stop:", round(t.stop_level, 6),
+            "stop:", round(t.stop_level, 10),
             "exit_reason:", t.exit_reason,
             "fills:", [(f.reason, f.index, f.qty_delta) for f in t.fills],
             "band_actions:", {k: sorted(list(v)) for k, v in t.band_actions.items()},
