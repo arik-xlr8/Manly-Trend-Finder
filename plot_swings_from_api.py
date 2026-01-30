@@ -1,10 +1,15 @@
-# plot_swings_from_api.py
+# plot_swings_live.py
 import os
 import time
+import threading
+import queue
 import requests
+import sys
+
 import numpy as np
 import pandas as pd
 import mplfinance as mpf
+import matplotlib.pyplot as plt
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Literal, Tuple, Set
@@ -16,10 +21,35 @@ from swings import find_swings, SwingPoint
 
 
 # ======================
-# 1) VERİ ÇEKME
+# 0) BEEP HELPERS
+# ======================
+
+def play_beep(kind: str):
+    """
+    kind: "LH" or "LB"
+    Windows: winsound.Beep
+    Others: terminal bell
+    """
+    try:
+        if sys.platform.startswith("win"):
+            import winsound
+            if kind == "LH":
+                winsound.Beep(1100, 180)
+                winsound.Beep(1100, 180)
+            else:  # "LB"
+                winsound.Beep(500, 220)
+        else:
+            print("\a", end="", flush=True)
+    except Exception:
+        pass
+
+
+# ======================
+# 1) VERİ ÇEKME (REST)
 # ======================
 
 BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
+WS_BASE_URL = os.getenv("BINANCE_FUTURES_WS_BASE_URL", "wss://fstream.binance.com/ws").rstrip("/")
 
 
 def fetch_ohlc_from_api(symbol: str = "BTCUSDT", interval: str = "15m", limit: int = 500) -> pd.DataFrame:
@@ -40,20 +70,58 @@ def fetch_ohlc_from_api(symbol: str = "BTCUSDT", interval: str = "15m", limit: i
     df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
     df[["open_time", "close_time"]] = df[["open_time", "close_time"]].astype(np.int64)
 
-    # Bot ile tutarlı: UTC index + sort
+    # UTC index + sort
     df["Date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df.set_index("Date", inplace=True)
     df = df.sort_index()
 
-    # ✅ Bot sadece kapanan mum ile çalışır → kapanmamış son mumu at
+    # ✅ Sadece kapanmış mumlar (son mum kapanmadıysa at)
     now_ms = int(time.time() * 1000)
     if len(df) > 0:
         last_close_time = int(df["close_time"].iloc[-1])
         if now_ms < last_close_time:
             df = df.iloc[:-1]
 
-    df = df[["open", "high", "low", "close", "volume"]]
-    df.columns = ["Open", "High", "Low", "Close", "Volume"]
+    df = df[["open_time", "close_time", "open", "high", "low", "close", "volume"]]
+    df.columns = ["OpenTime", "CloseTime", "Open", "High", "Low", "Close", "Volume"]
+    return df
+
+
+def _kline_to_row(k: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Binance WS kline payload'ından kapanmış mum satırına çevirir.
+    """
+    return {
+        "OpenTime": int(k["t"]),
+        "CloseTime": int(k["T"]),
+        "Open": float(k["o"]),
+        "High": float(k["h"]),
+        "Low": float(k["l"]),
+        "Close": float(k["c"]),
+        "Volume": float(k["v"]),
+    }
+
+
+def upsert_closed_candle(df: pd.DataFrame, row: Dict[str, Any], max_len: int) -> pd.DataFrame:
+    """
+    - Kapanmış mumu DF'e ekler (aynı OpenTime ise overwrite)
+    - Index: Date(open_time)
+    - max_len üstünü kırpar
+    """
+    dt = pd.to_datetime(row["OpenTime"], unit="ms", utc=True)
+
+    if dt in df.index:
+        for c in ["OpenTime", "CloseTime", "Open", "High", "Low", "Close", "Volume"]:
+            df.at[dt, c] = row[c]
+    else:
+        new = pd.DataFrame([row], index=[dt])
+        df = pd.concat([df, new], axis=0)
+
+    df = df.sort_index()
+
+    if len(df) > max_len:
+        df = df.iloc[-max_len:]
+
     return df
 
 
@@ -88,7 +156,6 @@ def _make_trade_key(
     fib1_index: Optional[int],
     fib_start_index: Optional[int],
 ) -> str:
-    # Bot tarafında TP50 spam’ini engellemek için "trade-bazlı" stabil anahtar.
     return (
         f"{direction}|"
         f"ei={int(entry_index)}|"
@@ -123,7 +190,6 @@ class Trade:
     band_actions: Dict[int, Set[str]] = field(default_factory=dict)
     fills: List[FillEvent] = field(default_factory=list)
 
-    # bot’un trade-bazlı kilitlemesi için
     trade_key: str = ""
 
     def refresh_trade_key(self) -> None:
@@ -164,12 +230,11 @@ def _fib_u(price: float, fib0: float, fib1: float) -> Optional[float]:
     return (price - fib0) / den
 
 
-# Bot.py ile aynı kural: 0 ve 1 bandı yasak
 BANNED_BANDS = {0, 1}
 
 
 # ======================
-# 5) STRATEJİ
+# 5) STRATEJİ (SENİN KOD)
 # ======================
 
 def generate_trades(
@@ -179,7 +244,6 @@ def generate_trades(
     right_bars: int = 1,
     max_chase_pct: float = 0.03,
 ) -> List[Trade]:
-
     closes = df["Close"].values
     highs_arr = df["High"].values
     lows_arr = df["Low"].values
@@ -262,7 +326,7 @@ def generate_trades(
             return
         tr.fills.append(FillEvent(
             index=idx,
-            qty_delta=-pos,  # pozisyonu 0'a getir
+            qty_delta=-pos,
             price=float(closes[idx]) if 0 <= idx < n else float(tr.entry_price),
             reason=reason
         ))
@@ -280,18 +344,9 @@ def generate_trades(
             return
         tr.base_k = int(np.floor(u))
         tr.band_actions = {}
-
         tr.refresh_trade_key()
 
     def handle_band_actions(sp: SwingPoint, signal_idx: int):
-        """
-        BOT UYUMLU:
-        - reason: "tp50 band=<k>" / "readd band=<k>"
-        - per-band sold/readd (trade içi)
-        - banned bands: 0,1
-        - long: LH -> tp50, sonra LB -> readd
-        - short: LB -> tp50, sonra LH -> readd
-        """
         nonlocal current_trade
         tr = current_trade
         if tr is None:
@@ -315,51 +370,22 @@ def generate_trades(
         actions = tr.band_actions[pivot_k]
         px = float(closes[signal_idx])
 
-        # LONG
         if tr.direction == "long":
-            # TP50: TOP pivot (LH) => sell 0.5
             if sp.kind == "LH" and ("sold" not in actions):
-                tr.fills.append(FillEvent(
-                    index=signal_idx,
-                    qty_delta=-0.5,
-                    price=px,
-                    reason=f"tp50 band={pivot_k}"
-                ))
+                tr.fills.append(FillEvent(index=signal_idx, qty_delta=-0.5, price=px, reason=f"tp50 band={pivot_k}"))
                 actions.add("sold")
                 return
-
-            # READD: BOTTOM pivot (LB) after sold => buy 0.5
             if sp.kind == "LB" and ("sold" in actions) and ("readd" not in actions):
-                tr.fills.append(FillEvent(
-                    index=signal_idx,
-                    qty_delta=+0.5,
-                    price=px,
-                    reason=f"readd band={pivot_k}"
-                ))
+                tr.fills.append(FillEvent(index=signal_idx, qty_delta=+0.5, price=px, reason=f"readd band={pivot_k}"))
                 actions.add("readd")
                 return
-
-        # SHORT
         else:
-            # TP50: BOTTOM pivot (LB) => buy 0.5 (short azaltma)
             if sp.kind == "LB" and ("sold" not in actions):
-                tr.fills.append(FillEvent(
-                    index=signal_idx,
-                    qty_delta=+0.5,
-                    price=px,
-                    reason=f"tp50 band={pivot_k}"
-                ))
+                tr.fills.append(FillEvent(index=signal_idx, qty_delta=+0.5, price=px, reason=f"tp50 band={pivot_k}"))
                 actions.add("sold")
                 return
-
-            # READD: TOP pivot (LH) after sold => sell 0.5 (short artırma)
             if sp.kind == "LH" and ("sold" in actions) and ("readd" not in actions):
-                tr.fills.append(FillEvent(
-                    index=signal_idx,
-                    qty_delta=-0.5,
-                    price=px,
-                    reason=f"readd band={pivot_k}"
-                ))
+                tr.fills.append(FillEvent(index=signal_idx, qty_delta=-0.5, price=px, reason=f"readd band={pivot_k}"))
                 actions.add("readd")
                 return
 
@@ -408,9 +434,7 @@ def generate_trades(
         prev_lb = last_lb
         prev_lh = last_lh
 
-        # =========================
-        # A) STOP taraması (öncelik)
-        # =========================
+        # A) STOP
         if current_trade is not None:
             start_i = max(current_trade.entry_index, last_checked_bar + 1)
             end_i = signal_idx
@@ -433,9 +457,7 @@ def generate_trades(
 
         last_checked_bar = max(last_checked_bar, signal_idx)
 
-        # =========================
-        # B) BELİRSİZ MOD
-        # =========================
+        # B) UNCERTAIN
         if mode == "uncertain":
             uptrend_confirm = (sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price)
             downtrend_confirm = (sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price)
@@ -469,13 +491,11 @@ def generate_trades(
                     last_lh = sp
                 continue
 
-        # =========================
-        # C) NORMAL MOD
-        # =========================
+        # C) NORMAL
         if current_trade is not None:
             handle_band_actions(sp, signal_idx)
 
-        # Trailing stop (pivotlara göre)
+        # trailing stop
         if current_trade is not None:
             if current_trade.direction == "long":
                 if sp.kind == "LH":
@@ -514,7 +534,7 @@ def generate_trades(
                     if short_last_low is not None and sp.index > short_last_low.index:
                         short_candidate_high = sp
 
-        # 1) poz açıkken ters sinyal -> kapat + flip
+        # flip exit
         if current_trade is not None:
             if current_trade.direction == "long":
                 if sp.kind == "LH" and prev_lh is not None and prev_lh.price > sp.price:
@@ -620,7 +640,7 @@ def generate_trades(
                             )
                         reset_trailing_state()
 
-        # 2) poz yokken entry
+        # entry
         if current_trade is None:
             if sp.kind == "LB" and prev_lb is not None and prev_lb.price < sp.price:
                 if not chase_too_much("long", pivot_idx, signal_idx):
@@ -715,10 +735,17 @@ def generate_trades(
 
 
 # ======================
-# 6) GRAFİK
+# 6) GRAFİK (CANLI REDRAW)
 # ======================
 
-def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Trade], symbol: str, interval: str):
+def plot_with_trades(
+    df: pd.DataFrame,
+    swings: List[SwingPoint],
+    trades: List[Trade],
+    symbol: str,
+    interval: str,
+    fig: Optional[plt.Figure] = None,
+):
     n = len(df)
 
     long_mask = np.zeros(n, dtype=bool)
@@ -737,7 +764,6 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
         ei = tr.entry_index
         if ei < 0 or ei >= n:
             continue
-
         xi = (n - 1) if tr.exit_index is None else tr.exit_index
         if xi < 0 or xi >= n:
             continue
@@ -777,14 +803,12 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
     for tr in trades:
         if not tr.fib_levels or tr.fib_start_index is None:
             continue
-
         sidx = tr.fib_start_index
         if sidx < 0 or sidx >= n:
             continue
 
         x1 = df.index[sidx]
         x2 = df.index[n - 1] if tr.exit_index is None else df.index[tr.exit_index]
-
         for _, price in tr.fib_levels:
             alines_segments.append([(x1, price), (x2, price)])
 
@@ -805,7 +829,7 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
         volume=True,
         figratio=(16, 9),
         figscale=1.2,
-        title=f"{symbol} {interval}",
+        title=f"{symbol} {interval} (LIVE)",
         ylabel="Fiyat",
         ylabel_lower="Hacim",
         tight_layout=True,
@@ -817,11 +841,75 @@ def plot_with_trades(df: pd.DataFrame, swings: List[SwingPoint], trades: List[Tr
     if alines_segments:
         plot_kwargs["alines"] = dict(alines=alines_segments, linewidths=0.7, alpha=0.45)
 
-    mpf.plot(df, **plot_kwargs)
+    # ✅ mplfinance fig reuse yok -> her seferinde yeni fig üret, eskisini kapat
+    if fig is not None:
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+
+    fig, _axes = mpf.plot(
+        df[["Open", "High", "Low", "Close", "Volume"]],
+        returnfig=True,
+        **plot_kwargs
+    )
+
+    plt.pause(0.001)
+    return fig
 
 
 # ======================
-# 7) MAIN
+# 7) WS DINLEYICI (KAPANAN MUM)
+# ======================
+
+def start_kline_ws(symbol: str, interval: str, out_queue: "queue.Queue[Dict[str, Any]]", stop_evt: threading.Event):
+    """
+    WebSocket'ten kline alır.
+    Sadece kapanan mumu out_queue'ya atar.
+    """
+    import json
+    from websocket import WebSocketApp
+
+    stream = f"{symbol.lower()}@kline_{interval}"
+    ws_url = f"{WS_BASE_URL}/{stream}"
+
+    def on_message(ws, message: str):
+        try:
+            obj = json.loads(message)
+            k = obj.get("k")
+            if not k:
+                return
+            if k.get("x") is True:  # candle closed
+                out_queue.put(k)
+        except Exception:
+            return
+
+    def on_error(ws, err):
+        print("[WS] error:", err)
+
+    def on_close(ws, status_code, msg):
+        print("[WS] closed:", status_code, msg)
+
+    def on_open(ws):
+        print("[WS] opened:", ws_url)
+
+    ws = WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+
+    while not stop_evt.is_set():
+        try:
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print("[WS] run_forever exception:", e)
+
+        if stop_evt.is_set():
+            break
+
+        print("[WS] reconnecting in 2s...")
+        time.sleep(2)
+
+
+# ======================
+# 8) MAIN (LIVE)
 # ======================
 
 def main():
@@ -837,15 +925,15 @@ def main():
 
     swing_debug = os.getenv("BOT_SWING_DEBUG", "false").lower() in ("1", "true", "yes", "y", "on")
     max_chase_pct = float(os.getenv("BOT_MAX_CHASE_PCT", "0.03"))
+    stop_buffer_pct = float(os.getenv("BOT_STOP_BUFFER_PCT", "0.0"))
 
+    print(f"[LIVE] REST init: {symbol} {interval} limit={limit}")
     df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=limit)
 
-    highs = df["High"].values
-    lows = df["Low"].values
-
+    # ilk hesap
     swings = find_swings(
-        highs,
-        lows,
+        df["High"].values,
+        df["Low"].values,
         left_bars=left_bars,
         right_bars=right_bars,
         min_distance=None,
@@ -855,30 +943,95 @@ def main():
         debug=swing_debug,
         ignore_last_bar=True,
     )
-
     trades = generate_trades(
         df,
         swings,
-        stop_buffer_pct=float(os.getenv("BOT_STOP_BUFFER_PCT", "0.0")),
+        stop_buffer_pct=stop_buffer_pct,
         right_bars=right_bars,
         max_chase_pct=max_chase_pct,
     )
 
-    print("Swing sayısı:", len(swings))
-    print("Trade sayısı:", len(trades))
-    for t in trades[-10:]:
-        print(
-            t.direction,
-            "key:", t.trade_key,
-            "entry:", t.entry_index,
-            "exit:", t.exit_index,
-            "stop:", round(t.stop_level, 10),
-            "exit_reason:", t.exit_reason,
-            "fills:", [(f.reason, f.index, f.qty_delta) for f in t.fills],
-            "band_actions:", {k: sorted(list(v)) for k, v in t.band_actions.items()},
-        )
+    # ✅ sadece yeni swing eklenince bip: count bazlı
+    last_swing_count = len(swings)
 
-    plot_with_trades(df, swings, trades, symbol, interval)
+    # canlı plot
+    plt.ion()
+    fig = None
+    fig = plot_with_trades(df, swings, trades, symbol, interval, fig=fig)
+
+    # ws thread + queue
+    q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+    stop_evt = threading.Event()
+    t = threading.Thread(target=start_kline_ws, args=(symbol, interval, q, stop_evt), daemon=True)
+    t.start()
+
+    last_redraw_at = 0.0
+
+    print("[LIVE] Listening closed candles via WS. Ctrl+C to stop.")
+    try:
+        while True:
+            try:
+                k = q.get(timeout=0.5)
+            except queue.Empty:
+                plt.pause(0.001)
+                continue
+
+            row = _kline_to_row(k)
+            df = upsert_closed_candle(df, row, max_len=limit)
+
+            # her kapanan mumda re-calc
+            swings = find_swings(
+                df["High"].values,
+                df["Low"].values,
+                left_bars=left_bars,
+                right_bars=right_bars,
+                min_distance=None,
+                alt_min_distance=None,
+                min_same_kind_gap=min_same_kind_gap,
+                min_opposite_gap=min_opposite_gap,
+                debug=swing_debug,
+                ignore_last_bar=True,
+            )
+
+            # ✅ YENİ TEPE/DİP EKLENDİYSE bip
+            if len(swings) > last_swing_count:
+                new_swings = swings[last_swing_count:]
+                for s in new_swings:
+                    play_beep(s.kind)
+                    print(f"[SWING] NEW {s.kind} idx={int(s.index)} price={float(s.price)}")
+                last_swing_count = len(swings)
+
+            trades = generate_trades(
+                df,
+                swings,
+                stop_buffer_pct=stop_buffer_pct,
+                right_bars=right_bars,
+                max_chase_pct=max_chase_pct,
+            )
+
+            # redraw throttle
+            now = time.time()
+            if now - last_redraw_at >= 0.05:
+                fig = plot_with_trades(df, swings, trades, symbol, interval, fig=fig)
+                last_redraw_at = now
+
+            last_close_dt = df.index[-1]
+            last_close = float(df["Close"].iloc[-1])
+            print(
+                f"[LIVE] closed={last_close_dt.isoformat()} close={last_close:.8f} | "
+                f"swings={len(swings)} trades={len(trades)}"
+            )
+
+    except KeyboardInterrupt:
+        print("\n[LIVE] stopping...")
+    finally:
+        stop_evt.set()
+        try:
+            plt.ioff()
+            plt.show(block=False)
+            plt.pause(0.2)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
