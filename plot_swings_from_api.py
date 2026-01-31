@@ -930,6 +930,54 @@ def main():
     print(f"[LIVE] REST init: {symbol} {interval} limit={limit}")
     df = fetch_ohlc_from_api(symbol=symbol, interval=interval, limit=limit)
 
+    # --- swing alarm state (confirmed pivots only) ---
+    # Key: pivot candle timestamp (df.index[pivot_idx])
+    # Val: (kind, rounded_price)
+    last_confirmed: Dict[pd.Timestamp, Tuple[str, float]] = {}
+
+    def confirmed_swings_only(df_: pd.DataFrame, swings_: List[SwingPoint], rb: int) -> List[SwingPoint]:
+        """
+        Pivot 'onaylı' sayılması için sağında rb mum daha kapanmış olmalı.
+        ignore_last_bar=True olduğu için son bar zaten yok sayılıyor.
+        Confirm sınırı:
+          pivot_idx <= len(df)-rb-2
+        """
+        n_ = len(df_)
+        max_pivot_idx = n_ - rb - 2
+        if max_pivot_idx < 0:
+            return []
+        out_ = [sp for sp in swings_ if sp.index <= max_pivot_idx]
+        return out_
+
+    def build_confirmed_map(df_: pd.DataFrame, swings_: List[SwingPoint], rb: int) -> Dict[pd.Timestamp, Tuple[str, float]]:
+        m: Dict[pd.Timestamp, Tuple[str, float]] = {}
+        conf = confirmed_swings_only(df_, swings_, rb)
+        for sp in conf:
+            if 0 <= sp.index < len(df_):
+                ts = df_.index[sp.index]
+                m[ts] = (sp.kind, float(np.round(float(sp.price), 12)))
+        return m
+
+    def diff_and_beep(prev: Dict[pd.Timestamp, Tuple[str, float]], nowm: Dict[pd.Timestamp, Tuple[str, float]]):
+        """
+        Beep koşulları:
+        - NEW confirmed pivot: ts yeni eklendiyse
+        - REPAINT/UPDATE: ts var ama (kind/price) değiştiyse
+        """
+        # NEW
+        for ts, (kind, price) in nowm.items():
+            if ts not in prev:
+                play_beep(kind)
+                print(f"[SWING] CONFIRMED NEW {kind} t={ts.isoformat()} price={price}")
+            else:
+                old_kind, old_price = prev[ts]
+                if old_kind != kind or abs(old_price - price) > 1e-12:
+                    play_beep(kind)
+                    print(
+                        f"[SWING] CONFIRMED REPAINT t={ts.isoformat()} "
+                        f"{old_kind}@{old_price} -> {kind}@{price}"
+                    )
+
     # ilk hesap
     swings = find_swings(
         df["High"].values,
@@ -951,8 +999,8 @@ def main():
         max_chase_pct=max_chase_pct,
     )
 
-    # ✅ sadece yeni swing eklenince bip: count bazlı
-    last_swing_count = len(swings)
+    # initial confirmed snapshot (ilk açılışta beep yok)
+    last_confirmed = build_confirmed_map(df, swings, right_bars)
 
     # canlı plot
     plt.ion()
@@ -993,13 +1041,10 @@ def main():
                 ignore_last_bar=True,
             )
 
-            # ✅ YENİ TEPE/DİP EKLENDİYSE bip
-            if len(swings) > last_swing_count:
-                new_swings = swings[last_swing_count:]
-                for s in new_swings:
-                    play_beep(s.kind)
-                    print(f"[SWING] NEW {s.kind} idx={int(s.index)} price={float(s.price)}")
-                last_swing_count = len(swings)
+            # ✅ alarm: sadece confirmed NEW/REPAINT
+            now_confirmed = build_confirmed_map(df, swings, right_bars)
+            diff_and_beep(last_confirmed, now_confirmed)
+            last_confirmed = now_confirmed
 
             trades = generate_trades(
                 df,
