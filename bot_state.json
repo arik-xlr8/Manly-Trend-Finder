@@ -1,15 +1,15 @@
 {
-  "last_closed_bar_time": "2026-01-31T15:36:00+00:00",
-  "base_qty": 4017005.0,
-  "active_stop_client_id": "MANLYBOT-STOP-1769873788",
-  "last_stop_price": 0.0012389,
+  "last_closed_bar_time": null,
+  "base_qty": 0.0,
+  "active_stop_client_id": "MANLYBOT-STOP-1769874744",
+  "last_stop_price": 80802.1,
   "stop_side": "SELL",
   "last_tp50_fill_bar": null,
-  "has_entered_once": true,
+  "has_entered_once": false,
   "startup_printed": true,
-  "prev_pos_amt": 4017005.0,
+  "prev_pos_amt": 0.0,
   "uncertain_active": false,
-  "last_entry_context": "trend",
+  "last_entry_context": null,
   "uncertain_last_pivot_idx": null,
   "uncertain_last_pivot_kind": null,
   "uncertain_last_pivot_price": null,
@@ -17,6 +17,6 @@
     "tp50_done": {},
     "readd_done": {},
     "tp50_pivot_idx": {},
-    "entry_pivot_idx": 296
+    "entry_pivot_idx": null
   }
 }

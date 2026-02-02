@@ -17,7 +17,7 @@ class SwingPoint:
 def find_swings(
     highs: Sequence[float],
     lows: Sequence[float],
-    left_bars: int = 3,
+    left_bars: int = 5,
     right_bars: int = 1,
 
     # artık kullanılmıyor, imza için duruyor
