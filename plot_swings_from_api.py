@@ -938,12 +938,12 @@ def main():
     def confirmed_swings_only(df_: pd.DataFrame, swings_: List[SwingPoint], rb: int) -> List[SwingPoint]:
         """
         Pivot 'onaylı' sayılması için sağında rb mum daha kapanmış olmalı.
-        ignore_last_bar=True olduğu için son bar zaten yok sayılıyor.
+        WS zaten sadece kapanmış mumları ekliyor, o yüzden ignore_last_bar=False olacak.
         Confirm sınırı:
-          pivot_idx <= len(df)-rb-2
+          pivot_idx <= len(df)-rb-1
         """
         n_ = len(df_)
-        max_pivot_idx = n_ - rb - 2
+        max_pivot_idx = n_ - rb - 1
         if max_pivot_idx < 0:
             return []
         out_ = [sp for sp in swings_ if sp.index <= max_pivot_idx]
@@ -989,7 +989,7 @@ def main():
         min_same_kind_gap=min_same_kind_gap,
         min_opposite_gap=min_opposite_gap,
         debug=swing_debug,
-        ignore_last_bar=True,
+        ignore_last_bar=False,  # ✅ WS/REST zaten kapanmamış mumu içeri almıyor
     )
     trades = generate_trades(
         df,
@@ -1038,7 +1038,7 @@ def main():
                 min_same_kind_gap=min_same_kind_gap,
                 min_opposite_gap=min_opposite_gap,
                 debug=swing_debug,
-                ignore_last_bar=True,
+                ignore_last_bar=False,  # ✅ WS zaten kapanmış mum gönderiyor
             )
 
             # ✅ alarm: sadece confirmed NEW/REPAINT
