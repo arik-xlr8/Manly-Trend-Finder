@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Football360 Heatmap</title>
+  <style>
+    :root{
+      --bg: #0b1020;
+      --panel: rgba(255,255,255,0.06);
+      --panel2: rgba(255,255,255,0.10);
+      --text: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.65);
+      --border: rgba(255,255,255,0.14);
+      --shadow: 0 10px 30px rgba(0,0,0,0.35);
+      --radius: 14px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body{
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      color: var(--text);
+      background:
+        radial-gradient(1200px 600px at 20% 10%, rgba(99,102,241,0.25), transparent 60%),
+        radial-gradient(900px 500px at 80% 20%, rgba(34,197,94,0.18), transparent 55%),
+        radial-gradient(1000px 600px at 50% 90%, rgba(244,63,94,0.18), transparent 60%),
+        var(--bg);
+      overflow: hidden;
+    }
+
+    .app{
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    /* Top bar / navbar */
+    header{
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(to bottom, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
+      backdrop-filter: blur(10px);
+    }
+    .brand{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding-right: 12px;
+      border-right: 1px solid var(--border);
+      min-width: 210px;
+    }
+    .dot{
+      width: 12px; height: 12px; border-radius: 999px;
+      background: conic-gradient(from 90deg, #22c55e, #f97316, #ef4444, #22c55e);
+      box-shadow: 0 0 0 6px rgba(255,255,255,0.04);
+    }
+    .brand h1{
+      font-size: 14px;
+      margin: 0;
+      letter-spacing: 0.4px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .nav-actions{
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .btn{
+      cursor: pointer;
+      user-select: none;
+      padding: 9px 11px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: linear-gradient(to bottom, rgba(255,255,255,0.10), rgba(255,255,255,0.06));
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .btn:active{ transform: translateY(1px); }
+    .btn.primary{
+      background: linear-gradient(to bottom, rgba(34,197,94,0.22), rgba(34,197,94,0.10));
+      border-color: rgba(34,197,94,0.35);
+    }
+
+    .controls{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      flex: 1;
+      justify-content: flex-end;
+    }
+
+    .control{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 12px;
+      box-shadow: 0 1px 0 rgba(255,255,255,0.05) inset;
+    }
+
+    label{
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    input[type="text"]{
+      width: 220px;
+      max-width: 48vw;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    input[type="range"]{
+      width: 160px;
+      max-width: 40vw;
+      accent-color: #a78bfa;
+    }
+
+    .pill{
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      font-size: 12px;
+      color: var(--muted);
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      white-space: nowrap;
+    }
+
+    /* Main layout */
+    main{
+      height: 100%;
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 12px;
+      padding: 12px;
+      overflow: hidden;
+    }
+
+    /* Heatmap */
+    .heatmap-wrap{
+      position: relative;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: rgba(255,255,255,0.03);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      min-height: 300px;
+    }
+
+    .heatmap{
+      height: 100%;
+      width: 100%;
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+      grid-auto-flow: dense;
+    }
+
+    .tile{
+      position: relative;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.18);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.06) inset;
+      overflow: hidden;
+      cursor: pointer;
+      transition: transform 120ms ease, border-color 120ms ease, filter 120ms ease;
+      display: flex;
+      align-items: flex-end;
+      padding: 10px;
+      min-height: 72px;
+      user-select: none;
+    }
+    .tile:hover{
+      transform: translateY(-2px);
+      border-color: rgba(255,255,255,0.35);
+      filter: saturate(1.15) brightness(1.05);
+    }
+
+    .tile::before{
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(400px 120px at 30% 20%, rgba(255,255,255,0.18), transparent 60%),
+        radial-gradient(340px 140px at 70% 70%, rgba(0,0,0,0.20), transparent 60%);
+      pointer-events: none;
+      mix-blend-mode: overlay;
+    }
+
+    .tile-top{
+      position: absolute;
+      top: 8px;
+      left: 10px;
+      right: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.90);
+      text-shadow: 0 2px 10px rgba(0,0,0,0.35);
+    }
+    .badge{
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: rgba(0,0,0,0.25);
+      border: 1px solid rgba(255,255,255,0.18);
+      font-weight: 800;
+      letter-spacing: 0.2px;
+      white-space: nowrap;
+    }
+
+    .name{
+      font-weight: 900;
+      font-size: 13px;
+      line-height: 1.05;
+      text-shadow: 0 4px 18px rgba(0,0,0,0.45);
+    }
+    .sub{
+      font-size: 12px;
+      color: rgba(255,255,255,0.75);
+      margin-top: 6px;
+      text-shadow: 0 4px 18px rgba(0,0,0,0.45);
+    }
+
+    /* Tooltip */
+    .tooltip{
+      position: absolute;
+      z-index: 10;
+      pointer-events: none;
+      transform: translate(-9999px, -9999px);
+      background: rgba(10, 14, 30, 0.92);
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 12px;
+      padding: 10px 12px;
+      min-width: 220px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .tooltip .t-title{
+      font-weight: 900;
+      margin-bottom: 6px;
+      font-size: 13px;
+    }
+    .tooltip .t-row{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.80);
+      margin: 3px 0;
+    }
+    .tooltip .t-row span:first-child{ color: rgba(255,255,255,0.60); }
+
+    /* Side panel */
+    .side{
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: rgba(255,255,255,0.04);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 240px;
+    }
+    .side header{
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      padding: 12px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    .side header h2{
+      margin: 0;
+      font-size: 13px;
+      letter-spacing: 0.2px;
+    }
+    .side .content{
+      padding: 12px;
+      overflow: auto;
+    }
+    .kvs{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px 12px;
+      font-size: 12px;
+      align-items: center;
+    }
+    .kvs .k{ color: var(--muted); }
+    .kvs .v{ font-weight: 800; }
+
+    .empty{
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    /* Modal */
+    .modal-backdrop{
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 50;
+    }
+    .modal{
+      width: min(520px, 96vw);
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(15, 18, 35, 0.92);
+      border-radius: 16px;
+      box-shadow: 0 25px 70px rgba(0,0,0,0.55);
+      backdrop-filter: blur(12px);
+      overflow: hidden;
+    }
+    .modal header{
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.04);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    .modal header h3{
+      margin: 0;
+      font-size: 13px;
+      letter-spacing: 0.2px;
+    }
+    .modal .body{
+      padding: 14px;
+      display: grid;
+      gap: 10px;
+    }
+    .field{
+      display: grid;
+      gap: 6px;
+    }
+    .field input, .field select{
+      height: 40px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      padding: 0 10px;
+      outline: none;
+    }
+    .modal .actions{
+      padding: 12px 14px;
+      border-top: 1px solid rgba(255,255,255,0.12);
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    @media (max-width: 980px){
+      body{ overflow: auto; }
+      header{ align-items: flex-start; }
+      .brand{ border-right: none; padding-right: 0; min-width: unset; }
+      .controls{ justify-content: flex-start; }
+      main{
+        grid-template-columns: 1fr;
+        grid-template-rows: 60vh auto;
+      }
+      .side{ min-height: 200px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <div class="dot"></div>
+        <h1>Football360 Heatmap</h1>
+      </div>
+
+      <!-- NAVBAR ACTIONS (istenen kısım) -->
+      <div class="nav-actions">
+        <button class="btn" id="merchBtn">🛍️ Merch</button>
+        <button class="btn primary" id="haliBtn">⚽ Halı Saha Ayarla</button>
+      </div>
+
+      <div class="controls">
+        <div class="control">
+          <label for="q">Ara</label>
+          <input id="q" type="text" placeholder="Futbolcu adı / takım / pozisyon..." />
+        </div>
+
+        <div class="control">
+          <label for="minAbs">Trend Oranı</label>
+          <input id="minAbs" type="range" min="0" max="10" step="0.5" value="0" />
+          <div class="pill"><span id="minAbsVal">0.0</span>%</div>
+        </div>
+
+        <div class="control">
+          <label>Görünüm</label>
+          <button class="btn" id="shuffleBtn">Karıştır</button>
+          <button class="btn" id="resetBtn">Sıfırla</button>
+        </div>
+
+        <div class="pill" id="statsPill">—</div>
+      </div>
+    </header>
+
+    <main>
+      <section class="heatmap-wrap">
+        <div class="heatmap" id="heatmap"></div>
+        <div class="tooltip" id="tooltip" aria-hidden="true"></div>
+      </section>
+
+      <aside class="side" id="side">
+        <header>
+          <h2>Detay</h2>
+          <span class="pill" id="selectedPill">Seçilmedi</span>
+        </header>
+        <div class="content" id="sideContent">
+          <div class="empty">
+            Heatmap’te bir tile’a tıkla. Renk = “form değişimi”, alan hissi = “değer”.
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <!-- MODAL: Halı Saha Ayarla -->
+  <div class="modal-backdrop" id="modalBackdrop" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="modal">
+      <header>
+        <h3>Halı Saha Ayarla</h3>
+        <button class="btn" id="closeModalBtn">Kapat ✕</button>
+      </header>
+      <div class="body">
+        <div class="field">
+          <label>Tarih</label>
+          <input type="date" id="msDate" />
+        </div>
+        <div class="field">
+          <label>Saat</label>
+          <input type="time" id="msTime" />
+        </div>
+        <div class="field">
+          <label>Konum</label>
+          <input type="text" id="msPlace" placeholder="Örn: Konyaaltı / Antalya" />
+        </div>
+        <div class="field">
+          <label>Kişi Sayısı</label>
+          <select id="msPeople">
+            <option value="10">10 (5v5)</option>
+            <option value="12">12 (6v6)</option>
+            <option value="14">14 (7v7)</option>
+            <option value="16">16 (8v8)</option>
+            <option value="22">22 (11v11)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Not</label>
+          <input type="text" id="msNote" placeholder="Örn: Krampon zorunlu, 2 kaleci var..." />
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="saveMatchBtn">Kaydet</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // --- Dataset ---
+    const PLAYERS = [
+      { name: "Lionel Messi", team: "Inter Miami", pos: "RW", value: 95, change:  3.6 },
+      { name: "Cristiano Ronaldo", team: "Al Nassr", pos: "ST", value: 90, change:  1.2 },
+      { name: "Kylian Mbappé", team: "Real Madrid", pos: "ST", value: 94, change:  4.8 },
+      { name: "Erling Haaland", team: "Man City", pos: "ST", value: 92, change: -2.1 },
+      { name: "Jude Bellingham", team: "Real Madrid", pos: "AM", value: 88, change:  2.9 },
+      { name: "Kevin De Bruyne", team: "Man City", pos: "CM", value: 82, change: -1.4 },
+      { name: "Vinícius Júnior", team: "Real Madrid", pos: "LW", value: 89, change:  3.1 },
+      { name: "Mohamed Salah", team: "Liverpool", pos: "RW", value: 84, change:  0.8 },
+      { name: "Harry Kane", team: "Bayern", pos: "ST", value: 83, change:  1.7 },
+      { name: "Robert Lewandowski", team: "Barcelona", pos: "ST", value: 78, change: -0.6 },
+      { name: "Luka Modrić", team: "Real Madrid", pos: "CM", value: 60, change:  0.3 },
+      { name: "Rodri", team: "Man City", pos: "DM", value: 80, change:  2.2 },
+      { name: "Neymar Jr.", team: "Al Hilal", pos: "LW", value: 74, change: -3.8 },
+      { name: "Antoine Griezmann", team: "Atleti", pos: "SS", value: 76, change:  1.1 },
+      { name: "Sadio Mané", team: "Al Nassr", pos: "LW", value: 70, change: -0.9 },
+      { name: "Bukayo Saka", team: "Arsenal", pos: "RW", value: 79, change:  2.6 },
+      { name: "Phil Foden", team: "Man City", pos: "AM", value: 77, change:  1.9 },
+      { name: "Bernardo Silva", team: "Man City", pos: "CM", value: 75, change:  0.7 },
+      { name: "Heung-min Son", team: "Spurs", pos: "LW", value: 74, change:  1.3 },
+      { name: "Victor Osimhen", team: "Napoli", pos: "ST", value: 78, change: -1.8 },
+      { name: "Hakan Çalhanoğlu", team: "Inter", pos: "CM", value: 68, change:  1.6 },
+      { name: "Arda Güler", team: "Real Madrid", pos: "AM", value: 62, change:  4.1 },
+      { name: "Mauro Icardi", team: "Galatasaray", pos: "ST", value: 66, change:  2.0 },
+      { name: "Edin Džeko", team: "Fenerbahçe", pos: "ST", value: 58, change: -0.4 },
+      { name: "Achraf Hakimi", team: "PSG", pos: "RB", value: 72, change:  0.9 },
+      { name: "Virgil van Dijk", team: "Liverpool", pos: "CB", value: 71, change: -1.1 },
+      { name: "Alisson Becker", team: "Liverpool", pos: "GK", value: 69, change:  0.4 },
+      { name: "Thibaut Courtois", team: "Real Madrid", pos: "GK", value: 67, change: -0.8 },
+      { name: "Pedri", team: "Barcelona", pos: "CM", value: 73, change:  1.5 },
+      { name: "Gavi", team: "Barcelona", pos: "CM", value: 70, change: -2.6 },
+      { name: "Lautaro Martínez", team: "Inter", pos: "ST", value: 81, change:  2.4 },
+      { name: "Rafael Leão", team: "Milan", pos: "LW", value: 76, change: -0.2 },
+      { name: "Jamāl Musiala", team: "Bayern", pos: "AM", value: 79, change:  3.0 },
+      { name: "Martin Ødegaard", team: "Arsenal", pos: "AM", value: 78, change:  1.0 },
+      { name: "Declan Rice", team: "Arsenal", pos: "DM", value: 77, change:  0.6 },
+      { name: "Álvaro Morata", team: "Atleti", pos: "ST", value: 64, change: -1.6 },
+      { name: "Khvicha Kvaratskhelia", team: "Napoli", pos: "LW", value: 75, change:  2.8 },
+      { name: "Bruno Fernandes", team: "Man United", pos: "AM", value: 76, change: -0.7 },
+      { name: "Marcus Rashford", team: "Man United", pos: "LW", value: 72, change: -2.0 },
+      { name: "Nicolò Barella", team: "Inter", pos: "CM", value: 74, change:  1.8 },
+    ];
+
+    const heatmapEl = document.getElementById("heatmap");
+    const tooltipEl = document.getElementById("tooltip");
+    const qEl = document.getElementById("q");
+    const minAbsEl = document.getElementById("minAbs");
+    const minAbsValEl = document.getElementById("minAbsVal");
+    const statsPill = document.getElementById("statsPill");
+
+    const sideContent = document.getElementById("sideContent");
+    const selectedPill = document.getElementById("selectedPill");
+    const shuffleBtn = document.getElementById("shuffleBtn");
+    const resetBtn = document.getElementById("resetBtn");
+
+    // Navbar buttons
+    const merchBtn = document.getElementById("merchBtn");
+    const haliBtn = document.getElementById("haliBtn");
+
+    // Modal
+    const modalBackdrop = document.getElementById("modalBackdrop");
+    const closeModalBtn = document.getElementById("closeModalBtn");
+    const saveMatchBtn = document.getElementById("saveMatchBtn");
+    const msDate = document.getElementById("msDate");
+    const msTime = document.getElementById("msTime");
+    const msPlace = document.getElementById("msPlace");
+    const msPeople = document.getElementById("msPeople");
+    const msNote = document.getElementById("msNote");
+
+    let data = structuredClone(PLAYERS);
+    let selected = null;
+
+    function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+
+    function colorFromChange(change){
+      const c = clamp(change, -10, 10);
+      const t = (c + 10) / 20; // 0..1
+      const hue = 0 + t * 120; // red..green
+      return `hsl(${hue} 78% 38%)`;
+    }
+
+    function formatSigned(n){
+      const sign = n > 0 ? "+" : "";
+      return `${sign}${n.toFixed(1)}%`;
+    }
+
+    function sizeClass(value){
+      if (value >= 90) return { col: 4, row: 3 };
+      if (value >= 82) return { col: 3, row: 2 };
+      if (value >= 72) return { col: 2, row: 2 };
+      return { col: 2, row: 1 };
+    }
+
+    function setGridColumns(){
+      const w = heatmapEl.clientWidth;
+      const cols = clamp(Math.floor(w / 120), 4, 12);
+      heatmapEl.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+    }
+
+    function matchQuery(p, q){
+      if (!q) return true;
+      const s = (p.name + " " + p.team + " " + p.pos).toLowerCase();
+      return s.includes(q.toLowerCase().trim());
+    }
+
+    function render(){
+      setGridColumns();
+
+      const q = qEl.value;
+      const minAbs = parseFloat(minAbsEl.value);
+      minAbsValEl.textContent = minAbs.toFixed(1);
+
+      const filtered = data.filter(p => matchQuery(p, q) && Math.abs(p.change) >= minAbs);
+
+      heatmapEl.innerHTML = "";
+      const frag = document.createDocumentFragment();
+
+      for (const p of filtered){
+        const s = sizeClass(p.value);
+        const tile = document.createElement("div");
+        tile.className = "tile";
+        tile.style.background = colorFromChange(p.change);
+        tile.style.gridColumn = `span ${s.col}`;
+        tile.style.gridRow = `span ${s.row}`;
+
+        tile.innerHTML = `
+          <div class="tile-top">
+            <div class="badge">${p.team}</div>
+            <div class="badge">${formatSigned(p.change)}</div>
+          </div>
+          <div>
+            <div class="name">${p.name}</div>
+            <div class="sub">${p.pos} • Değer: ${p.value}</div>
+          </div>
+        `;
+
+        tile.addEventListener("mousemove", (e) => {
+          tooltipEl.style.transform = `translate(${e.clientX + 14}px, ${e.clientY + 14}px)`;
+          tooltipEl.setAttribute("aria-hidden", "false");
+          tooltipEl.innerHTML = `
+            <div class="t-title">${p.name}</div>
+            <div class="t-row"><span>Takım</span><span>${p.team}</span></div>
+            <div class="t-row"><span>Pozisyon</span><span>${p.pos}</span></div>
+            <div class="t-row"><span>Değer</span><span>${p.value}</span></div>
+            <div class="t-row"><span>Değişim</span><span>${formatSigned(p.change)}</span></div>
+          `;
+        });
+        tile.addEventListener("mouseleave", () => {
+          tooltipEl.style.transform = "translate(-9999px, -9999px)";
+          tooltipEl.setAttribute("aria-hidden", "true");
+        });
+
+        tile.addEventListener("click", () => {
+          selected = p;
+          updateSide();
+        });
+
+        frag.appendChild(tile);
+      }
+
+      heatmapEl.appendChild(frag);
+
+      const pos = filtered.filter(x => x.change > 0).length;
+      const neg = filtered.filter(x => x.change < 0).length;
+      const zero = filtered.length - pos - neg;
+      statsPill.textContent = `Gösterilen: ${filtered.length} • +${pos} / -${neg} / 0:${zero}`;
+    }
+
+    function updateSide(){
+      if (!selected){
+        selectedPill.textContent = "Seçilmedi";
+        sideContent.innerHTML = `<div class="empty">Heatmap’te bir tile’a tıkla.</div>`;
+        return;
+      }
+      selectedPill.textContent = selected.pos;
+
+      const bg = colorFromChange(selected.change);
+      sideContent.innerHTML = `
+        <div style="padding:12px;border-radius:14px;border:1px solid rgba(255,255,255,0.14);background:${bg};box-shadow:0 12px 30px rgba(0,0,0,0.25) inset;">
+          <div style="font-weight:900;font-size:14px;margin-bottom:6px;">${selected.name}</div>
+          <div style="color:rgba(255,255,255,0.82);font-size:12px;">${selected.team} • ${selected.pos}</div>
+        </div>
+        <div style="height:12px;"></div>
+        <div class="kvs">
+          <div class="k">Değer</div><div class="v">${selected.value}</div>
+          <div class="k">Değişim</div><div class="v">${formatSigned(selected.change)}</div>
+          <div class="k">Renk</div><div class="v">Kırmızı → Yeşil</div>
+          <div class="k">Boyut</div><div class="v">Değer → Büyük tile</div>
+        </div>
+      `;
+    }
+
+    // Controls
+    qEl.addEventListener("input", render);
+    minAbsEl.addEventListener("input", render);
+
+    shuffleBtn.addEventListener("click", () => {
+      for (let i = data.length - 1; i > 0; i--){
+        const j = Math.floor(Math.random() * (i + 1));
+        [data[i], data[j]] = [data[j], data[i]];
+      }
+      render();
+    });
+
+    resetBtn.addEventListener("click", () => {
+      data = structuredClone(PLAYERS);
+      qEl.value = "";
+      minAbsEl.value = "0";
+      selected = null;
+      updateSide();
+      render();
+    });
+
+    // Navbar actions
+    merchBtn.addEventListener("click", () => {
+      alert("Eklenecek");
+    });
+
+    function openModal(){
+      modalBackdrop.style.display = "flex";
+      modalBackdrop.setAttribute("aria-hidden", "false");
+
+      // default date/time: bugün + 20:00
+      const now = new Date();
+      const yyyy = now.getFullYear();
+      const mm = String(now.getMonth()+1).padStart(2,"0");
+      const dd = String(now.getDate()).padStart(2,"0");
+      msDate.value ||= `${yyyy}-${mm}-${dd}`;
+      msTime.value ||= "20:00";
+      msPlace.value ||= "";
+      msNote.value ||= "";
+    }
+
+    function closeModal(){
+      modalBackdrop.style.display = "none";
+      modalBackdrop.setAttribute("aria-hidden", "true");
+    }
+
+    haliBtn.addEventListener("click", openModal);
+    closeModalBtn.addEventListener("click", closeModal);
+
+    modalBackdrop.addEventListener("click", (e) => {
+      if (e.target === modalBackdrop) closeModal();
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeModal();
+    });
+
+    saveMatchBtn.addEventListener("click", () => {
+      const payload = {
+        date: msDate.value,
+        time: msTime.value,
+        place: msPlace.value.trim(),
+        people: parseInt(msPeople.value, 10),
+        note: msNote.value.trim()
+      };
+
+      if (!payload.date || !payload.time || !payload.place){
+        alert("Tarih, saat ve konum zorunlu.");
+        return;
+      }
+
+      // Şimdilik localStorage'a kaydedelim (backend yoksa)
+      const key = "football360_matches";
+      const arr = JSON.parse(localStorage.getItem(key) || "[]");
+      arr.push({ ...payload, id: crypto.randomUUID(), createdAt: new Date().toISOString() });
+      localStorage.setItem(key, JSON.stringify(arr));
+
+      alert(`Kaydedildi ✅\n${payload.date} ${payload.time} • ${payload.place} • ${payload.people} kişi`);
+      closeModal();
+    });
+
+    // Responsive grid
+    window.addEventListener("resize", () => {
+      clearTimeout(window.__hm_to);
+      window.__hm_to = setTimeout(render, 60);
+    });
+
+    // Initial
+    render();
+    updateSide();
+  </script>
+</body>
+</html>
